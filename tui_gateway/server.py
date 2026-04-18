@@ -1274,7 +1274,6 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
 def _make_agent(sid: str, key: str, session_id: str | None = None):
     from run_agent import AIAgent
     from hermes_cli.runtime_provider import resolve_runtime_provider
-
     cfg = _load_cfg()
     system_prompt = ((cfg.get("agent") or {}).get("system_prompt", "") or "").strip()
     runtime = resolve_runtime_provider(requested=None)
