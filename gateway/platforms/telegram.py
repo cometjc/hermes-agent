@@ -2356,15 +2356,22 @@ class TelegramAdapter(BasePlatformAdapter):
         - ``require_mention`` is disabled
         - the message replies to the bot
         - the bot is @mentioned
-        - the text/caption matches a configured regex wake-word pattern
+        - the message matches a configured regex wake-word pattern
+        - the message is the first message of a newly-created forum topic
+          (``forum_topic_created`` service message), so topics opened by
+          forwarding a message kick the bot off immediately
+        - the message is a forward (``forward_origin`` / ``forward_from`` /
+          ``forward_from_chat``), which is the common way users seed a new
+          topic with external context
 
         When ``require_mention`` is enabled, slash commands are not given
         special treatment — they must pass the same mention/reply checks
-        as any other group message.  Users can still trigger commands via
+        as any other group message. Users can still trigger commands via
         the Telegram bot menu (``/command@botname``) or by explicitly
         mentioning the bot (``@botname /command``), both of which are
         recognised as mentions by :meth:`_message_mentions_bot`.
         """
+
         if not self._is_group_chat(message):
             return True
         thread_id = getattr(message, "message_thread_id", None)
@@ -2382,7 +2389,21 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         if self._message_mentions_bot(message):
             return True
-        return self._message_matches_mention_patterns(message)
+        if self._message_matches_mention_patterns(message):
+            return True
+        # Forum topic kickoff: the first message of a newly-created topic (often
+        # produced by forwarding an external message into a group) should wake
+        # the bot even without an explicit @mention, otherwise users have to
+        # send a second message before the bot acts.
+        if getattr(message, "forum_topic_created", None):
+            return True
+        if (
+            getattr(message, "forward_origin", None)
+            or getattr(message, "forward_from", None)
+            or getattr(message, "forward_from_chat", None)
+        ):
+            return True
+        return False
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
