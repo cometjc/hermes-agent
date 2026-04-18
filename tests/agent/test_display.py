@@ -31,6 +31,62 @@ class TestBuildToolPreview:
         assert result is not None
         assert "ls -la" in result
 
+    # ---- Terminal: cd prefix stripping (preserves signal in short previews) ----
+
+    def test_terminal_strips_leading_cd(self):
+        """`cd /path && cmd` should preview as just `cmd`."""
+        result = build_tool_preview(
+            "terminal",
+            {"command": "cd /home/user/repo && git log --oneline"},
+        )
+        assert result == "git log --oneline"
+
+    def test_terminal_strips_chained_cd(self):
+        """Multiple chained `cd a && cd b && cmd` all collapse."""
+        result = build_tool_preview(
+            "terminal",
+            {"command": "cd /a && cd /b && echo hi"},
+        )
+        assert result == "echo hi"
+
+    def test_terminal_strips_cd_with_quoted_path(self):
+        """Quoted paths (with spaces) still strip correctly."""
+        result = build_tool_preview(
+            "terminal",
+            {"command": 'cd "/path with spaces" && ls'},
+        )
+        assert result == "ls"
+
+    def test_terminal_unchanged_without_cd_prefix(self):
+        """No `cd` prefix → command preserved verbatim."""
+        result = build_tool_preview("terminal", {"command": "git log"})
+        assert result == "git log"
+
+    def test_terminal_truncates_after_cd_strip(self):
+        """After stripping cd, truncation still respects max_len."""
+        result = build_tool_preview(
+            "terminal",
+            {
+                "command": (
+                    "cd /home/jethro/repo/agent/hermes-agent && "
+                    "pytest tests/test_subagent_topic_router.py -v"
+                )
+            },
+            max_len=40,
+        )
+        # The prefix is gone; the real command fits with an ellipsis.
+        assert result is not None
+        assert result.startswith("pytest")
+        assert len(result) <= 40
+
+    def test_terminal_malformed_cd_kept_as_is(self):
+        """`cd /a &&` with no follow-up command: don't mangle."""
+        result = build_tool_preview(
+            "terminal",
+            {"command": "cd /a &&"},
+        )
+        assert result == "cd /a &&"
+
     def test_web_search_preview(self):
         result = build_tool_preview("web_search", {"query": "hello world"})
         assert result is not None

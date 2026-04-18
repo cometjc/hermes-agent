@@ -6,6 +6,7 @@ Used by AIAgent._execute_tool_calls for CLI feedback.
 
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -167,6 +168,36 @@ def _oneline(text: str) -> str:
     return " ".join(text.split())
 
 
+# Matches a leading `cd <path> && ` (one or more), so chained prefixes like
+# `cd a && cd b && real_cmd` collapse to `real_cmd`.  The path token is
+# permissive: any run of non-whitespace, quoted, or ${...}/$(...) segments.
+# Whitespace inside single/double quotes is preserved.  We intentionally do
+# NOT try to handle `cd foo; real_cmd` — semicolon-chained cds are rare and
+# have different short-circuit semantics.
+_LEADING_CD_RE = re.compile(
+    r'^\s*cd\s+'
+    r'(?:"[^"]*"|\'[^\']*\'|\S+)'
+    r'\s*&&\s*'
+)
+
+
+def _strip_leading_cd(cmd: str) -> str:
+    """Strip leading ``cd <path> && `` prefixes from a shell command.
+
+    Useful for display / preview — the real command after ``cd`` is what a
+    reader wants to see.  Preserves the command untouched when there's no
+    leading ``cd ... &&`` or when the pattern doesn't cleanly match.
+    """
+    out = cmd
+    # Cap iterations to guard against pathological input.
+    for _ in range(4):
+        m = _LEADING_CD_RE.match(out)
+        if not m:
+            break
+        out = out[m.end():]
+    return out if out else cmd
+
+
 def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -> str | None:
     """Build a short preview of a tool call's primary argument for display.
 
@@ -251,6 +282,22 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
             "rl_test_inference": f"{args.get('num_steps', 3)} steps",
         }
         return rl_previews.get(tool_name)
+
+    # Terminal: collapse leading `cd <path> && ...` so the short preview
+    # shows the real command rather than the cd prefix.  Common agent habit
+    # `cd /long/path && git log` otherwise truncates to "cd /long/path..."
+    # in platforms that cap the preview (gateway default 40 chars), hiding
+    # all signal about what was actually run.  Prefer the `workdir` tool
+    # parameter; this fallback handles the case when we forget.
+    if tool_name == "terminal":
+        cmd = _oneline(str(args.get("command", "")))
+        if cmd:
+            cmd = _strip_leading_cd(cmd)
+        if not cmd:
+            return None
+        if max_len > 0 and len(cmd) > max_len:
+            cmd = cmd[:max_len - 3] + "..."
+        return cmd
 
     key = primary_args.get(tool_name)
     if not key:
