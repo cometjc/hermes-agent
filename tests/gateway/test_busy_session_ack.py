@@ -25,6 +25,7 @@ sys.modules.setdefault("telegram", _tg)
 sys.modules.setdefault("telegram.constants", _tg.constants)
 sys.modules.setdefault("telegram.ext", types.ModuleType("telegram.ext"))
 
+from gateway.config import Platform
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -38,10 +39,10 @@ from gateway.platforms.base import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_event(text="hello", chat_id="123", platform_val="telegram"):
+def _make_event(text="hello", chat_id="123", platform_val="slack"):
     """Build a minimal MessageEvent."""
     source = SessionSource(
-        platform=MagicMock(value=platform_val),
+        platform=Platform(platform_val),
         chat_id=chat_id,
         chat_type="private",
         user_id="user1",
@@ -70,23 +71,116 @@ def _make_runner():
     runner.session_store = None
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()
+    runner._steering_failed_sessions = {}
     return runner, _AGENT_PENDING_SENTINEL
 
 
-def _make_adapter(platform_val="telegram"):
+def _make_adapter(platform_val="slack"):
     """Build a minimal adapter mock."""
     adapter = MagicMock()
     adapter._pending_messages = {}
     adapter._send_with_retry = AsyncMock()
     adapter.config = MagicMock()
     adapter.config.extra = {}
-    adapter.platform = MagicMock(value=platform_val)
+    adapter.platform = Platform(platform_val)
     return adapter
 
 
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+class TestTelegramBusyRouting:
+    """Telegram busy messages should steer when possible and queue otherwise."""
+
+    @pytest.mark.asyncio
+    async def test_prefers_steer_and_sets_route_reaction(self):
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter(platform_val="telegram")
+        adapter._reactions_enabled = lambda: True
+        adapter._set_reaction = AsyncMock(return_value=True)
+
+        event = _make_event(text="please inspect the logs", platform_val="telegram")
+        sk = build_session_key(event.source)
+
+        running_agent = MagicMock()
+        running_agent.steer.return_value = True
+        runner._running_agents[sk] = running_agent
+        runner.adapters[event.source.platform] = adapter
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        running_agent.steer.assert_called_once_with("please inspect the logs")
+        running_agent.interrupt.assert_not_called()
+        assert sk not in adapter._pending_messages
+        adapter._set_reaction.assert_awaited_once_with(
+            "123",
+            "msg1",
+            "🧭",
+        )
+        adapter._send_with_retry.assert_not_awaited()
+        assert sk not in runner._steering_failed_sessions
+
+    @pytest.mark.asyncio
+    async def test_queues_when_steer_raises_and_latches_failure(self):
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter(platform_val="telegram")
+        adapter._reactions_enabled = lambda: True
+        adapter._set_reaction = AsyncMock(return_value=True)
+
+        event = _make_event(text="fallback please", platform_val="telegram")
+        sk = build_session_key(event.source)
+
+        running_agent = MagicMock()
+        running_agent.steer.side_effect = RuntimeError("boom")
+        runner._running_agents[sk] = running_agent
+        runner.adapters[event.source.platform] = adapter
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        running_agent.steer.assert_called_once_with("fallback please")
+        running_agent.interrupt.assert_not_called()
+        assert sk in adapter._pending_messages
+        assert adapter._pending_messages[sk].text == "fallback please"
+        assert runner._steering_failed_sessions.get(sk) is True
+        adapter._set_reaction.assert_awaited_once_with(
+            "123",
+            "msg1",
+            "⏸️",
+        )
+        adapter._send_with_retry.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_queues_without_retry_after_steer_failure_latch(self):
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter(platform_val="telegram")
+        adapter._reactions_enabled = lambda: True
+        adapter._set_reaction = AsyncMock(return_value=True)
+
+        event = _make_event(text="use queue", platform_val="telegram")
+        sk = build_session_key(event.source)
+
+        running_agent = MagicMock()
+        running_agent.steer = AsyncMock()
+        runner._running_agents[sk] = running_agent
+        runner._steering_failed_sessions[sk] = True
+        runner.adapters[event.source.platform] = adapter
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        running_agent.steer.assert_not_called()
+        assert sk in adapter._pending_messages
+        assert adapter._pending_messages[sk].text == "use queue"
+        adapter._set_reaction.assert_awaited_once_with(
+            "123",
+            "msg1",
+            "⏸️",
+        )
+        adapter._send_with_retry.assert_not_awaited()
+
 
 class TestBusySessionAck:
     """User sends a message while agent is running — should get acknowledgment."""
