@@ -3333,9 +3333,13 @@ class GatewayRunner:
                     adapter._pending_messages[_quick_key] = queued_event
                 return "No active agent — /steer queued for the next turn."
 
-            # /model must not be used while the agent is running.
+            # /model dispatches directly to the handler even mid-run. The
+            # adapter-layer bypass check (gateway/platforms/base.py) now
+            # treats every resolvable slash command as bypass-eligible
+            # (upstream PR #12334), so this block is a defensive fallback
+            # in case an adapter skips the bypass check.
             if _cmd_def_inner and _cmd_def_inner.name == "model":
-                return "Agent is running — wait or /stop first, then switch models."
+                return await self._handle_model_command(event)
 
             # /approve and /deny must bypass the running-agent interrupt path.
             # The agent thread is blocked on a threading.Event inside
