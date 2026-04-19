@@ -187,6 +187,7 @@ class TestTelegramApprovalCallback:
         query.message = MagicMock()
         query.message.chat_id = 12345
         query.from_user = MagicMock()
+        query.from_user.id = 123
         query.from_user.first_name = "Norbert"
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
@@ -195,8 +196,9 @@ class TestTelegramApprovalCallback:
         update.callback_query = query
         context = MagicMock()
 
-        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
-            await adapter._handle_callback_query(update, context)
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "123"}):
+            with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+                await adapter._handle_callback_query(update, context)
 
         mock_resolve.assert_called_once_with("agent:main:telegram:group:12345:99", "once")
         query.answer.assert_called_once()
@@ -215,6 +217,7 @@ class TestTelegramApprovalCallback:
         query.message = MagicMock()
         query.message.chat_id = 12345
         query.from_user = MagicMock()
+        query.from_user.id = 123
         query.from_user.first_name = "Alice"
         query.answer = AsyncMock()
         query.edit_message_text = AsyncMock()
@@ -223,8 +226,9 @@ class TestTelegramApprovalCallback:
         update.callback_query = query
         context = MagicMock()
 
-        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
-            await adapter._handle_callback_query(update, context)
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "123"}):
+            with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+                await adapter._handle_callback_query(update, context)
 
         mock_resolve.assert_called_once_with("some-session", "deny")
         edit_kwargs = query.edit_message_text.call_args[1]
@@ -240,6 +244,7 @@ class TestTelegramApprovalCallback:
         query.message = MagicMock()
         query.message.chat_id = 12345
         query.from_user = MagicMock()
+        query.from_user.id = 123
         query.from_user.first_name = "Bob"
         query.answer = AsyncMock()
 
@@ -247,8 +252,9 @@ class TestTelegramApprovalCallback:
         update.callback_query = query
         context = MagicMock()
 
-        with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
-            await adapter._handle_callback_query(update, context)
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "123"}):
+            with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+                await adapter._handle_callback_query(update, context)
 
         # Should NOT resolve — already handled
         mock_resolve.assert_not_called()

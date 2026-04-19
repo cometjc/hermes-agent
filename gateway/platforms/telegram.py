@@ -8,6 +8,8 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
+import concurrent.futures
+import itertools
 import json
 import logging
 import os
@@ -251,6 +253,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._model_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
+        # Clarify prompt state: clarify_id → pending request metadata
+        self._clarify_pending: Dict[str, dict] = {}
+        self._clarify_counter = itertools.count(1)
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     @staticmethod
     def _is_callback_user_authorized(user_id: str) -> bool:
@@ -260,6 +266,183 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or user_id in allowed_ids
+
+    def build_clarify_callback(
+        self,
+        *,
+        chat_id: str,
+        thread_id: Optional[str],
+        user_id: str,
+    ):
+        """Build a blocking clarify(question, choices) callback for AIAgent.
+
+        The returned callable runs in the agent worker thread, sends a Telegram
+        inline keyboard on the gateway loop, then blocks until the matching
+        ``clr:`` callback query resolves the pending Future.
+        """
+
+        def _clarify(question: str, choices: Optional[list[str]] = None) -> str:
+            if not self._bot:
+                return "Clarify is not available: Telegram is not connected."
+            if not self._loop or self._loop.is_closed():
+                return "Clarify is not available in this execution context."
+
+            clean_choices = [str(c).strip() for c in (choices or []) if str(c).strip()][:4]
+            if not clean_choices:
+                return "Clarify is not available in this execution context."
+
+            clarify_id = f"cl:{next(self._clarify_counter)}"
+            response_future: concurrent.futures.Future[str] = concurrent.futures.Future()
+
+            send_future = asyncio.run_coroutine_threadsafe(
+                self._send_clarify_prompt(
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    clarify_id=clarify_id,
+                    question=question,
+                    choices=clean_choices,
+                ),
+                self._loop,
+            )
+
+            try:
+                send_result = send_future.result(timeout=30)
+            except Exception as exc:
+                return f"Failed to send clarify prompt: {exc}"
+
+            if not send_result or not send_result.success:
+                return f"Failed to send clarify prompt: {getattr(send_result, 'error', 'unknown error')}"
+
+            self._clarify_pending[clarify_id] = {
+                "future": response_future,
+                "user_id": str(user_id),
+                "chat_id": str(chat_id),
+                "thread_id": str(thread_id) if thread_id is not None else None,
+                "message_id": str(send_result.message_id) if send_result.message_id is not None else None,
+                "choices": clean_choices,
+            }
+
+            timeout_s = float(os.getenv("HERMES_TELEGRAM_CLARIFY_TIMEOUT", "120"))
+            timeout_message = (
+                "The user did not provide a response within the time limit. "
+                "Use your best judgement to make the choice and proceed."
+            )
+
+            try:
+                return response_future.result(timeout=timeout_s)
+            except concurrent.futures.TimeoutError:
+                pending = self._clarify_pending.pop(clarify_id, None)
+                if pending and pending.get("message_id"):
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            self._clear_clarify_markup(
+                                chat_id=chat_id,
+                                message_id=str(pending["message_id"]),
+                                thread_id=thread_id,
+                            ),
+                            self._loop,
+                        )
+                    except Exception:
+                        pass
+                return timeout_message
+            finally:
+                self._clarify_pending.pop(clarify_id, None)
+
+        return _clarify
+
+    async def _send_clarify_prompt(
+        self,
+        *,
+        chat_id: str,
+        thread_id: Optional[str],
+        clarify_id: str,
+        question: str,
+        choices: list[str],
+    ) -> SendResult:
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        rows = [[InlineKeyboardButton(label, callback_data=f"clr:{clarify_id}:{idx}")]
+                for idx, label in enumerate(choices)]
+        keyboard = InlineKeyboardMarkup(rows)
+        kwargs: Dict[str, Any] = {
+            "chat_id": int(chat_id),
+            "text": f"❓ {question}",
+            "reply_markup": keyboard,
+            **self._link_preview_kwargs(),
+        }
+        message_thread_id = self._message_thread_id_for_send(thread_id)
+        if message_thread_id is not None:
+            kwargs["message_thread_id"] = message_thread_id
+        msg = await self._bot.send_message(**kwargs)
+        return SendResult(success=True, message_id=str(msg.message_id))
+
+    async def _clear_clarify_markup(
+        self,
+        *,
+        chat_id: str,
+        message_id: str,
+        thread_id: Optional[str],
+    ) -> None:
+        if not self._bot:
+            return
+        kwargs: Dict[str, Any] = {
+            "chat_id": int(chat_id),
+            "message_id": int(message_id),
+            "reply_markup": None,
+        }
+        message_thread_id = self._message_thread_id_for_send(thread_id)
+        if message_thread_id is not None:
+            kwargs["message_thread_id"] = message_thread_id
+        try:
+            await self._bot.edit_message_reply_markup(**kwargs)
+        except Exception:
+            pass
+
+    async def _handle_clarify_callback(self, query, data: str) -> None:
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer(text="Invalid clarify data.")
+            return
+
+        clarify_id = parts[1]
+        try:
+            choice_idx = int(parts[2])
+        except ValueError:
+            await query.answer(text="Invalid clarify choice.")
+            return
+
+        pending = self._clarify_pending.get(clarify_id)
+        if not pending:
+            await query.answer(text="This clarify request has already been resolved.")
+            return
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        expected_user_id = str(pending.get("user_id", ""))
+        if expected_user_id and caller_id != expected_user_id:
+            await query.answer(text="⛔ You are not authorized to answer this clarification.")
+            return
+
+        choices = pending.get("choices") or []
+        if choice_idx < 0 or choice_idx >= len(choices):
+            await query.answer(text="Invalid clarify choice.")
+            return
+
+        choice = choices[choice_idx]
+        future = pending.get("future")
+        if future and not future.done():
+            future.set_result(choice)
+
+        self._clarify_pending.pop(clarify_id, None)
+
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        try:
+            await query.answer(text=f"Selected: {choice}")
+        except Exception:
+            pass
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -788,6 +971,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
             # Decide between webhook and polling mode
             webhook_url = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
+            self._loop = asyncio.get_running_loop()
 
             if webhook_url:
                 # ── Webhook mode ─────────────────────────────────────
@@ -842,6 +1026,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     await delete_webhook(drop_pending_updates=False)
 
                 loop = asyncio.get_running_loop()
+                self._loop = loop
 
                 def _polling_error_callback(error: Exception) -> None:
                     if self._polling_error_task and not self._polling_error_task.done():
@@ -1670,6 +1855,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                 except Exception as exc:
                     logger.error("Failed to resolve gateway approval from Telegram button: %s", exc)
+            return
+
+        # --- Clarify callbacks (clr:<clarify_id>:<choice_index>) ---
+        if data.startswith("clr:"):
+            await self._handle_clarify_callback(query, data)
             return
 
         # --- Update prompt callbacks ---

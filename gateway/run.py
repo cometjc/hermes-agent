@@ -949,6 +949,24 @@ class GatewayRunner:
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
 
+    def _build_telegram_clarify_callback(self, source: SessionSource):
+        """Return a Telegram clarify callback for this source, if supported."""
+        if source.platform != Platform.TELEGRAM:
+            return None
+        adapter = self.adapters.get(source.platform)
+        build = getattr(adapter, "build_clarify_callback", None)
+        if not callable(build) or not source.user_id:
+            return None
+        try:
+            return build(
+                chat_id=source.chat_id,
+                thread_id=source.thread_id,
+                user_id=source.user_id,
+            )
+        except Exception as exc:
+            logger.debug("Failed to build Telegram clarify callback for %s: %s", source.description, exc)
+            return None
+
     def _resolve_session_agent_runtime(
         self,
         *,
@@ -6601,6 +6619,7 @@ class GatewayRunner:
                     session_id=task_id,
                     platform=platform_key,
                     user_id=source.user_id,
+                    clarify_callback=self._build_telegram_clarify_callback(source),
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
@@ -9735,6 +9754,7 @@ class GatewayRunner:
                     session_id=session_id,
                     platform=platform_key,
                     user_id=source.user_id,
+                    clarify_callback=self._build_telegram_clarify_callback(source),
                     gateway_session_key=session_key,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
