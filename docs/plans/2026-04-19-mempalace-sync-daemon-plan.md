@@ -208,10 +208,9 @@ if __name__ == "__main__":
 ```
 
 **Step 3: `tests/conftest.py`**
-
 ```python
-import sqlite3, tempfile, shutil, os
-from pathlib import Path
+# tests/conftest.py
+import sqlite3
 import pytest
 
 # Copy the Hermes schema verbatim so tests mirror production exactly.
@@ -406,12 +405,12 @@ git add .
 git commit -m "feat: StateReader.query_new_messages (read-only)"
 ```
 
-### Task 2.2: Handle SQLite busy / locked gracefully
+### Task 2.2: Handle SQLite busy / locked / corrupted gracefully
 
-**Step 1: Failing test**
+**Step 1: Failing tests**
 
 ```python
-# tests/test_state_reader.py (add)
+# tests/test_state_reader.py (append)
 import pytest
 from mempalace_sync.state_reader import StateReader, StateReadError
 
@@ -419,17 +418,25 @@ def test_raises_on_missing_db(tmp_path):
     reader = StateReader(tmp_path / "nope.db")
     with pytest.raises(StateReadError):
         reader.query_new_messages(0)
+
+def test_raises_on_corrupted_db(tmp_path):
+    bad_db = tmp_path / "bad.db"
+    bad_db.write_bytes(b"not a real sqlite database")
+    reader = StateReader(bad_db)
+    with pytest.raises(StateReadError):
+        reader.query_new_messages(0)
 ```
 
-**Step 2: Run → fail, then add exception class + try/except in `_connect()`.**
+**Why two tests:** `sqlite3.connect(uri)` succeeds lazily for corrupted files — the DatabaseError only fires when you actually execute a query. So `_connect()` and `query_new_messages()` BOTH need try/except. First-draft plans that only wrapped `_connect()` leaked raw `sqlite3.DatabaseError` for corrupted files.
+
+**Step 2: Run → fail, then add StateReadError + wrap BOTH entry points.**
 
 ```python
-# state_reader.py (append)
+# state_reader.py
 class StateReadError(RuntimeError):
-    pass
+    """Raised when Hermes state.db cannot be read (missing, locked, or corrupted)."""
 
-# Wrap _connect:
-    def _connect(self):
+    def _connect(self) -> sqlite3.Connection:
         try:
             uri = f"file:{self.db_path}?mode=ro"
             conn = sqlite3.connect(uri, uri=True, timeout=5.0)
@@ -437,7 +444,18 @@ class StateReadError(RuntimeError):
             return conn
         except sqlite3.Error as e:
             raise StateReadError(f"Cannot open {self.db_path}: {e}") from e
+
+    def query_new_messages(self, since_id: int, limit: int = 10_000) -> list[dict[str, Any]]:
+        sql = "..."
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(sql, (since_id, limit)).fetchall()
+        except sqlite3.Error as e:
+            raise StateReadError(f"Failed to read {self.db_path}: {e}") from e
+        return [dict(r) for r in rows]
 ```
+
+Note: `StateReadError` is NOT a `sqlite3.Error` subclass, so when `_connect()` raises it, the outer `except sqlite3.Error` in `query_new_messages` leaves it alone (no double-wrapping).
 
 **Step 3: Run → pass, commit.**
 
