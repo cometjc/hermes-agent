@@ -264,6 +264,64 @@ class TestGetModelCapabilities:
         assert caps is not None
         assert caps.supports_vision is False
 
+    def test_supports_steering_from_explicit_flag(self):
+        """Explicit supports_steering=true should be surfaced on the model caps."""
+        registry = {
+            "anthropic": {
+                "id": "anthropic",
+                "models": {
+                    "claude-sonnet-4": {
+                        "id": "claude-sonnet-4",
+                        "tool_call": True,
+                        "supports_steering": True,
+                        "limit": {"context": 200000, "output": 64000},
+                    },
+                },
+            },
+        }
+        with patch("agent.models_dev.fetch_models_dev", return_value=registry):
+            caps = get_model_capabilities("anthropic", "claude-sonnet-4")
+        assert caps is not None
+        assert caps.supports_steering is True
+
+    def test_supports_steering_defaults_from_tool_call(self):
+        """Tool-capable models should default to steering-capable unless marked otherwise."""
+        registry = {
+            "anthropic": {
+                "id": "anthropic",
+                "models": {
+                    "claude-sonnet-4": {
+                        "id": "claude-sonnet-4",
+                        "tool_call": True,
+                        "limit": {"context": 200000, "output": 64000},
+                    },
+                },
+            },
+        }
+        with patch("agent.models_dev.fetch_models_dev", return_value=registry):
+            caps = get_model_capabilities("anthropic", "claude-sonnet-4")
+        assert caps is not None
+        assert caps.supports_steering is True
+
+    def test_supports_steering_false_for_non_tool_models(self):
+        """Models without tool_call support should remain non-steering by default."""
+        registry = {
+            "anthropic": {
+                "id": "anthropic",
+                "models": {
+                    "plain-model": {
+                        "id": "plain-model",
+                        "tool_call": False,
+                        "limit": {"context": 200000, "output": 8192},
+                    },
+                },
+            },
+        }
+        with patch("agent.models_dev.fetch_models_dev", return_value=registry):
+            caps = get_model_capabilities("anthropic", "plain-model")
+        assert caps is not None
+        assert caps.supports_steering is False
+
     def test_modalities_non_dict_handled(self):
         """Non-dict modalities field should not crash."""
         registry = {

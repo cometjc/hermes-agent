@@ -16,7 +16,7 @@ import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -390,6 +390,14 @@ class SessionEntry:
     resume_reason: Optional[str] = None  # e.g. "restart_timeout"
     last_resume_marked_at: Optional[datetime] = None
 
+    # Busy-routing state used by the Telegram gateway.
+    # ``pending_steer`` is for in-turn steering notes that should be injected
+    # into the currently running agent; ``pending_queue`` is for turn-boundary
+    # follow-ups that should be delivered once the current turn finishes.
+    pending_steer: list[Dict[str, Any]] = field(default_factory=list)
+    pending_queue: list[Dict[str, Any]] = field(default_factory=list)
+    steering_failed: bool = False
+
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "session_key": self.session_key,
@@ -416,6 +424,9 @@ class SessionEntry:
                 if self.last_resume_marked_at
                 else None
             ),
+            "pending_steer": self.pending_steer,
+            "pending_queue": self.pending_queue,
+            "steering_failed": self.steering_failed,
         }
         if self.origin:
             result["origin"] = self.origin.to_dict()
@@ -464,6 +475,9 @@ class SessionEntry:
             resume_pending=data.get("resume_pending", False),
             resume_reason=data.get("resume_reason"),
             last_resume_marked_at=last_resume_marked_at,
+            pending_steer=list(data.get("pending_steer", []) or []),
+            pending_queue=list(data.get("pending_queue", []) or []),
+            steering_failed=data.get("steering_failed", False),
         )
 
 
@@ -915,6 +929,124 @@ class SessionStore:
             entry.last_resume_marked_at = None
             self._save()
             return True
+
+    def _pending_bucket(self, entry: SessionEntry, kind: str) -> list[Dict[str, Any]]:
+        if kind == "steer":
+            return entry.pending_steer
+        if kind == "queue":
+            return entry.pending_queue
+        raise ValueError(f"Unknown pending kind: {kind}")
+
+    @staticmethod
+    def _pending_is_expired(item: Dict[str, Any]) -> bool:
+        expires_at = item.get("expires_at")
+        if not expires_at:
+            return False
+        try:
+            return datetime.fromisoformat(str(expires_at)) <= _now()
+        except (TypeError, ValueError):
+            return False
+
+    def _prune_expired_pending_locked(self, entry: SessionEntry) -> None:
+        entry.pending_steer = [item for item in entry.pending_steer if not self._pending_is_expired(item)]
+        entry.pending_queue = [item for item in entry.pending_queue if not self._pending_is_expired(item)]
+
+    def get_pending_state(self, session_key: str) -> Optional[Dict[str, list[Dict[str, Any]]]]:
+        """Return a snapshot of pending steering/queue state for a session."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return None
+            self._prune_expired_pending_locked(entry)
+            return {
+                "pending_steer": [dict(item) for item in entry.pending_steer],
+                "pending_queue": [dict(item) for item in entry.pending_queue],
+            }
+
+    def set_steering_failed(self, session_key: str, failed: bool = True) -> bool:
+        """Set or clear the session-scoped steering-failed flag."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or entry.steering_failed == failed:
+                return False
+            entry.steering_failed = failed
+            entry.updated_at = _now()
+            self._save()
+            return True
+
+    def clear_pending_routing(self, session_key: str) -> bool:
+        """Clear all pending steering/queue state for a session."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return False
+            changed = bool(entry.pending_steer or entry.pending_queue or entry.steering_failed)
+            entry.pending_steer.clear()
+            entry.pending_queue.clear()
+            entry.steering_failed = False
+            if changed:
+                entry.updated_at = _now()
+                self._save()
+            return changed
+
+    def add_pending_item(
+        self,
+        session_key: str,
+        kind: str,
+        item: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Append a pending steering or queued item to the session store."""
+        if kind not in {"steer", "queue"}:
+            raise ValueError(f"Unknown pending kind: {kind}")
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return None
+            self._prune_expired_pending_locked(entry)
+            bucket = self._pending_bucket(entry, kind)
+            bucket.append(dict(item))
+            entry.updated_at = _now()
+            self._save()
+            return bucket[-1]
+
+    def reclassify_pending_queue(self, session_key: str) -> int:
+        """Move queued items to the steering bucket, preserving FIFO order."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return 0
+            self._prune_expired_pending_locked(entry)
+            if not entry.pending_queue:
+                return 0
+            moved = len(entry.pending_queue)
+            entry.pending_steer.extend(entry.pending_queue)
+            entry.pending_queue.clear()
+            entry.updated_at = _now()
+            self._save()
+            return moved
+
+    def pop_pending_item(self, session_key: str, kind: str) -> Optional[Dict[str, Any]]:
+        """Pop the oldest pending item of the requested kind."""
+        if kind not in {"steer", "queue"}:
+            raise ValueError(f"Unknown pending kind: {kind}")
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return None
+            self._prune_expired_pending_locked(entry)
+            bucket = self._pending_bucket(entry, kind)
+            if not bucket:
+                return None
+            item = bucket.pop(0)
+            entry.updated_at = _now()
+            self._save()
+            return dict(item)
 
     def prune_old_entries(self, max_age_days: int) -> int:
         """Drop SessionEntry records older than max_age_days.

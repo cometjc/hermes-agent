@@ -599,6 +599,8 @@ DEFAULT_CONFIG = {
         "tool_progress_command": False,  # Enable /verbose command in messaging gateway
         "tool_progress_overrides": {},  # DEPRECATED — use display.platforms instead
         "tool_preview_length": 0,  # Max chars for tool call previews (0 = no limit, show full paths/commands)
+        "pending_steer_ttl": "permanent",  # Telegram: keep pending steer notes until consumed unless overridden
+        "pending_queue_ttl": "permanent",  # Telegram: keep queued follow-ups until consumed unless overridden
         "platforms": {},  # Per-platform display overrides: {"telegram": {"tool_progress": "all"}, "slack": {"tool_progress": "off"}}
     },
 
