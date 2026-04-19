@@ -16,8 +16,37 @@ from tools.telegram_topic_tool import (
 )
 
 
+class _AsyncCMWrapper:
+    """Minimal async context manager that yields the underlying mock bot.
+
+    Python looks up ``__aenter__``/``__aexit__`` on the *type* during
+    ``async with``, so we can't just attach them to a MagicMock instance --
+    we need a real class. Entry/exit counts are recorded on the wrapper
+    itself (not on ``bot``) because MagicMock intercepts any attribute read.
+    """
+    # Class-level counters so tests can assert even across wrapper instances.
+    aenter_total = 0
+    aexit_total = 0
+
+    def __init__(self, bot):
+        self._bot = bot
+
+    async def __aenter__(self):
+        type(self).aenter_total += 1
+        return self._bot
+
+    async def __aexit__(self, exc_type, exc, tb):
+        type(self).aexit_total += 1
+        return False
+
+
 def _install_telegram_bot_mock(monkeypatch, bot):
-    telegram_mod = SimpleNamespace(Bot=lambda token: bot)
+    # The tool now uses ``async with Bot(token) as bot:`` so we need a real
+    # class whose instances are async context managers.
+    # Reset counters for isolation between tests.
+    _AsyncCMWrapper.aenter_total = 0
+    _AsyncCMWrapper.aexit_total = 0
+    telegram_mod = SimpleNamespace(Bot=lambda token: _AsyncCMWrapper(bot))
     monkeypatch.setitem(sys.modules, "telegram", telegram_mod)
 
 
@@ -116,6 +145,7 @@ class TestWriteOps:
         bot.create_forum_topic = AsyncMock(
             return_value=SimpleNamespace(message_thread_id=17585, name="discuss-q3")
         )
+        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
         _install_telegram_bot_mock(monkeypatch, bot)
         _install_gateway_config(monkeypatch)
 
@@ -130,6 +160,80 @@ class TestWriteOps:
         assert result["thread_id"] == "17585"
         assert result["name"] == "discuss-q3"
         bot.create_forum_topic.assert_awaited_once_with(chat_id=-1001234567890, name="discuss-q3")
+        # Self-verify probe sends a service message to the new topic.
+        bot.send_message.assert_awaited_once()
+        probe_kwargs = bot.send_message.await_args.kwargs
+        assert probe_kwargs["chat_id"] == -1001234567890
+        assert probe_kwargs["message_thread_id"] == 17585
+        assert probe_kwargs["disable_notification"] is True
+
+    def test_create_retries_once_when_thread_id_is_ghost(self, monkeypatch):
+        """First create returns a ghost thread_id that fails probe; retry succeeds."""
+        bot = MagicMock()
+        bot.create_forum_topic = AsyncMock(side_effect=[
+            SimpleNamespace(message_thread_id=2228, name="ghost-topic"),   # fake
+            SimpleNamespace(message_thread_id=2229, name="ghost-topic"),   # real
+        ])
+        # Probe #1 raises topic_not_found, probe #2 succeeds.
+        bot.send_message = AsyncMock(side_effect=[
+            Exception("Bad Request: message thread not found"),
+            SimpleNamespace(message_id=1),
+        ])
+        _install_telegram_bot_mock(monkeypatch, bot)
+        _install_gateway_config(monkeypatch)
+
+        result = json.loads(telegram_topic_tool({
+            "action": "create",
+            "target": "telegram:-1001234567890",
+            "name": "ghost-topic",
+        }))
+
+        assert result["success"] is True
+        assert result["thread_id"] == "2229"   # fresh ID from retry, not ghost 2228
+        assert bot.create_forum_topic.await_count == 2
+        assert bot.send_message.await_count == 2
+
+    def test_create_does_not_retry_on_non_ghost_probe_error(self, monkeypatch):
+        """If probe fails with e.g. no_rights, bubble it up instead of retrying."""
+        bot = MagicMock()
+        bot.create_forum_topic = AsyncMock(
+            return_value=SimpleNamespace(message_thread_id=5000, name="x")
+        )
+        bot.send_message = AsyncMock(
+            side_effect=Exception("Forbidden: not enough rights to send text messages")
+        )
+        _install_telegram_bot_mock(monkeypatch, bot)
+        _install_gateway_config(monkeypatch)
+
+        result = json.loads(telegram_topic_tool({
+            "action": "create",
+            "target": "telegram:-1001234567890",
+            "name": "x",
+        }))
+
+        # Original create succeeded but probe failed with a non-retryable error.
+        assert "error" in result
+        assert result["code"] == "no_rights"
+        # Only one create attempt -- no retry on non-ghost errors.
+        assert bot.create_forum_topic.await_count == 1
+
+    def test_bot_lifecycle_uses_async_context_manager(self, monkeypatch):
+        """Regression: Bot must be entered/exited so HTTPXRequest shuts down."""
+        bot = MagicMock()
+        bot.create_forum_topic = AsyncMock(
+            return_value=SimpleNamespace(message_thread_id=42, name="t")
+        )
+        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
+        _install_telegram_bot_mock(monkeypatch, bot)
+        _install_gateway_config(monkeypatch)
+
+        telegram_topic_tool({
+            "action": "create",
+            "target": "telegram:-1001234567890",
+            "name": "t",
+        })
+        assert _AsyncCMWrapper.aenter_total == 1
+        assert _AsyncCMWrapper.aexit_total == 1
 
     def test_close_calls_bot(self, monkeypatch):
         bot = MagicMock()

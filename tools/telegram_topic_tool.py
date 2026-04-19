@@ -185,47 +185,103 @@ async def _with_retry(coro_factory, *, attempts: int = 3):
             await asyncio.sleep(delay)
 
 
-async def _run_topic_op(token: str, op: str, *, chat_id: str, thread_id: Optional[str], name: Optional[str]):
-    """Invoke the underlying python-telegram-bot call for a single op."""
-    from telegram import Bot
+async def _create_and_verify_topic(bot, *, int_chat_id: int, name: str):
+    """Create a forum topic and verify the returned thread_id is usable.
 
-    bot = Bot(token=token)
-    int_chat_id = int(chat_id)
+    Works around an observed flake where ``createForumTopic`` returns
+    success=200 with a ``message_thread_id`` that does not actually exist on
+    Telegram's side (subsequent ``sendMessage`` to the topic returns 400
+    ``message thread not found``). We self-verify by posting a lightweight
+    service message into the newly-created topic. If the probe fails with
+    ``topic_not_found``, we retry the create exactly once and return the
+    fresh thread_id.
 
-    if op == "create":
+    Side benefit: the probe message causes the gateway to observe the topic,
+    so it shows up in ``telegram_topic(action='list')`` immediately.
+    """
+    topic = await _with_retry(
+        lambda: bot.create_forum_topic(chat_id=int_chat_id, name=name)
+    )
+    tid = topic.message_thread_id
+    tname = topic.name
+
+    probe_text = f"✨ Topic created: {tname}"
+
+    async def _probe(thread_id: int):
+        await _with_retry(lambda: bot.send_message(
+            chat_id=int_chat_id,
+            message_thread_id=thread_id,
+            text=probe_text,
+            disable_notification=True,
+        ))
+
+    try:
+        await _probe(tid)
+    except Exception as exc:
+        if _classify_error(exc) != "topic_not_found":
+            raise
+        logger.warning(
+            "telegram_topic create returned ghost thread_id=%s (verification "
+            "failed: %s) -- retrying create once",
+            tid, _sanitize_error_text(exc),
+        )
         topic = await _with_retry(
             lambda: bot.create_forum_topic(chat_id=int_chat_id, name=name)
         )
+        tid = topic.message_thread_id
+        tname = topic.name
+        # Probe again; if this fails too, let the error propagate up.
+        await _probe(tid)
+
+    return tid, tname
+
+
+async def _run_topic_op(token: str, op: str, *, chat_id: str, thread_id: Optional[str], name: Optional[str]):
+    """Invoke the underlying python-telegram-bot call for a single op.
+
+    Uses ``async with Bot(...)`` so HTTPXRequest lifecycle is managed
+    correctly -- otherwise each call leaks an un-shutdown async client, and
+    under concurrent use we have observed stale/ghost responses.
+    """
+    from telegram import Bot
+
+    int_chat_id = int(chat_id)
+
+    async with Bot(token=token) as bot:
+        if op == "create":
+            tid, tname = await _create_and_verify_topic(
+                bot, int_chat_id=int_chat_id, name=name
+            )
+            return {
+                "success": True,
+                "platform": "telegram",
+                "action": "create",
+                "chat_id": chat_id,
+                "thread_id": str(tid),
+                "name": tname,
+            }
+
+        int_thread_id = int(thread_id)
+        if op == "close":
+            await _with_retry(lambda: bot.close_forum_topic(chat_id=int_chat_id, message_thread_id=int_thread_id))
+        elif op == "reopen":
+            await _with_retry(lambda: bot.reopen_forum_topic(chat_id=int_chat_id, message_thread_id=int_thread_id))
+        elif op == "delete":
+            await _with_retry(lambda: bot.delete_forum_topic(chat_id=int_chat_id, message_thread_id=int_thread_id))
+        elif op == "rename":
+            await _with_retry(
+                lambda: bot.edit_forum_topic(chat_id=int_chat_id, message_thread_id=int_thread_id, name=name)
+            )
+        else:
+            return {"error": f"Unknown op: {op}", "code": "unknown"}
+
         return {
             "success": True,
             "platform": "telegram",
-            "action": "create",
+            "action": op,
             "chat_id": chat_id,
-            "thread_id": str(topic.message_thread_id),
-            "name": topic.name,
+            "thread_id": str(int_thread_id),
         }
-
-    int_thread_id = int(thread_id)
-    if op == "close":
-        await _with_retry(lambda: bot.close_forum_topic(chat_id=int_chat_id, message_thread_id=int_thread_id))
-    elif op == "reopen":
-        await _with_retry(lambda: bot.reopen_forum_topic(chat_id=int_chat_id, message_thread_id=int_thread_id))
-    elif op == "delete":
-        await _with_retry(lambda: bot.delete_forum_topic(chat_id=int_chat_id, message_thread_id=int_thread_id))
-    elif op == "rename":
-        await _with_retry(
-            lambda: bot.edit_forum_topic(chat_id=int_chat_id, message_thread_id=int_thread_id, name=name)
-        )
-    else:
-        return {"error": f"Unknown op: {op}", "code": "unknown"}
-
-    return {
-        "success": True,
-        "platform": "telegram",
-        "action": op,
-        "chat_id": chat_id,
-        "thread_id": str(int_thread_id),
-    }
 
 
 def _handle_write_op(op: str, *, chat_id: str, thread_id: Optional[str], name: Optional[str] = None) -> str:
@@ -262,7 +318,9 @@ def _handle_list(chat_id: str) -> str:
         "topics": topics,
         "note": (
             "Telegram Bot API does not expose a topic enumeration method; this list "
-            "only includes topics where a message has been observed by the gateway."
+            "only includes topics where the gateway has observed at least one message. "
+            "Topics created via action='create' are auto-probed with a service message, "
+            "so they appear here once the gateway persists the resulting session."
         ),
     })
 
