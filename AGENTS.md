@@ -8,6 +8,23 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 source venv/bin/activate  # ALWAYS activate before running Python
 ```
 
+## Branch & Worktree Workflow
+
+This fork (`cometjc/hermes-agent`) runs a daily cron that fast-forwards `main` to `upstream/main` (see the `hermes-agent-fork-sync` skill). Feature work must be structured around this:
+
+- **Never develop directly on `main`.** `main` is a mirror of upstream and will be fast-forwarded daily; local commits on `main` will be lost or cause the sync to abort.
+- **Each feature/fix uses its own `git worktree`.** Create the worktree off a fresh `main`:
+  ```bash
+  git fetch upstream main
+  git worktree add ../hermes-agent-<slug> -b <type>/<slug> upstream/main
+  ```
+- **Before merging a feature branch back to `main`, rebase it onto the current `main` first.** The feature branch's base will have drifted from `main` (`main` moved forward daily). Steps:
+  1. `git fetch upstream main && git checkout main && git merge --ff-only upstream/main` — ensure local main is current.
+  2. `cd <worktree> && git rebase main` — re-base the feature branch onto the new tip.
+  3. **If conflicts arise, resolve them in the worktree, finish the rebase, re-run the relevant tests** before continuing the merge. Do not merge a dirty rebase.
+  4. Then merge back (`git checkout main && git merge --ff-only <branch>`) — the merge should now be a pure fast-forward.
+- If the feature branch is long-lived, periodically rebase it onto `main` (weekly or after significant upstream changes) so the final merge-day rebase isn't a mega-conflict.
+
 ## Project Structure
 
 ```
