@@ -8,6 +8,11 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 source .venv/bin/activate  # ALWAYS activate before running Python
 ```
 
+## AUQ Timeout Policy
+
+- When using `ask_user_questions(nonBlocking: false, ...)`, if the call times out, do not retry the same blocking call.
+- Keep the returned `session_id` from that timed-out attempt and fetch answers later with `get_answered_questions(session_id=..., blocking=false/true)`.
+
 ## Branch & Worktree Workflow
 
 This fork (`cometjc/hermes-agent`) runs a daily cron that fast-forwards `main` to `upstream/main` (see the `hermes-agent-fork-sync` skill). Feature work must be structured around this:
