@@ -39,11 +39,11 @@ def _make_event(chat_id: str = "123", message_id: str = "456") -> MessageEvent:
 # ── _reactions_enabled ───────────────────────────────────────────────
 
 
-def test_reactions_disabled_by_default(monkeypatch):
-    """Telegram reactions should be disabled by default."""
+def test_reactions_enabled_by_default(monkeypatch):
+    """Telegram reactions should be enabled by default."""
     monkeypatch.delenv("TELEGRAM_REACTIONS", raising=False)
     adapter = _make_adapter()
-    assert adapter._reactions_enabled() is False
+    assert adapter._reactions_enabled() is True
 
 
 def test_reactions_enabled_when_set_true(monkeypatch):
@@ -143,8 +143,8 @@ async def test_on_processing_start_adds_eyes_reaction(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_on_processing_start_skipped_when_disabled(monkeypatch):
-    """Processing start should not react when reactions are disabled."""
-    monkeypatch.delenv("TELEGRAM_REACTIONS", raising=False)
+    """Processing start should not react when reactions are explicitly disabled."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "false")
     adapter = _make_adapter()
     event = _make_event()
 
@@ -207,8 +207,8 @@ async def test_on_processing_complete_failure_clears_reaction(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_on_processing_complete_skipped_when_disabled(monkeypatch):
-    """Processing complete should not react when reactions are disabled."""
-    monkeypatch.delenv("TELEGRAM_REACTIONS", raising=False)
+    """Processing complete should not react when reactions are explicitly disabled."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "false")
     adapter = _make_adapter()
     event = _make_event()
 
