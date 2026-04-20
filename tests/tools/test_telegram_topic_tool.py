@@ -192,19 +192,28 @@ class TestValidation:
 
 class TestWriteOps:
     def test_create_calls_bot_and_returns_thread_id(self, monkeypatch):
-        bot = MagicMock()
-        bot.create_forum_topic = AsyncMock(
-            return_value=SimpleNamespace(message_thread_id=17585, name="discuss-q3")
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="-1003837358001",
+            thread_id="1981",
+            chat_name="小蟹助手群",
         )
-        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
-        _install_telegram_bot_mock(monkeypatch, bot)
-        _install_gateway_config(monkeypatch)
+        try:
+            bot = MagicMock()
+            bot.create_forum_topic = AsyncMock(
+                return_value=SimpleNamespace(message_thread_id=17585, name="discuss-q3")
+            )
+            bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
+            _install_telegram_bot_mock(monkeypatch, bot)
+            _install_gateway_config(monkeypatch)
 
-        result = json.loads(telegram_topic_tool({
-            "action": "create",
-            "target": "telegram:-1001234567890",
-            "name": "discuss-q3",
-        }))
+            result = json.loads(telegram_topic_tool({
+                "action": "create",
+                "target": "telegram:-1001234567890",
+                "name": "discuss-q3",
+            }))
+        finally:
+            clear_session_vars(tokens)
 
         assert result["success"] is True
         assert result["action"] == "create"
@@ -217,6 +226,9 @@ class TestWriteOps:
         assert probe_kwargs["chat_id"] == -1001234567890
         assert probe_kwargs["message_thread_id"] == 17585
         assert probe_kwargs["disable_notification"] is True
+        assert "Context:" in probe_kwargs["text"]
+        assert "小蟹助手群" in probe_kwargs["text"]
+        assert "1981" in probe_kwargs["text"]
 
     def test_create_retries_once_when_thread_id_is_ghost(self, monkeypatch):
         """First create returns a ghost thread_id that fails probe; retry succeeds."""

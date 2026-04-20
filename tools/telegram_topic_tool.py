@@ -47,7 +47,8 @@ TELEGRAM_TOPIC_SCHEMA = {
         "'telegram:<chat_id>:<thread_id>' for close/reopen/delete/rename.\n\n"
         "For convenience, action='create' and action='list' may omit target "
         "when running inside a Telegram session; they will default to the current "
-        "session chat_id. A separate action='current_chat_id' returns the current "
+        "session chat_id. action='create' also posts a short context note into the "
+        "new topic. A separate action='current_chat_id' returns the current "
         "session chat/thread context.\n\n"
         "Errors return a structured 'code' field: 'no_rights', 'topic_not_found', "
         "'chat_not_found', 'topic_closed', or 'unknown'.\n\n"
@@ -165,6 +166,28 @@ def _get_current_telegram_context() -> Tuple[Optional[str], Optional[str], Optio
     return chat_id, thread_id, chat_name, None
 
 
+def _build_create_topic_context(topic_name: str) -> str:
+    """Build a short context note for the initial message in a new topic."""
+    from gateway.session_context import get_session_env
+
+    chat_name = get_session_env("HERMES_SESSION_CHAT_NAME", "").strip()
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "").strip()
+
+    if chat_name:
+        source = chat_name
+    elif chat_id:
+        source = f"chat {chat_id}"
+    else:
+        source = "current session"
+
+    thread_label = f"thread {thread_id}" if thread_id else "current thread"
+    return (
+        f"Context: from {source} / {thread_label}; "
+        f"topic '{topic_name}' continues the current request."
+    )
+
+
 def _resolve_topic_target(action: str, target: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """Resolve an explicit target or fall back to the current Telegram session."""
     if target:
@@ -261,7 +284,7 @@ async def _create_and_verify_topic(bot, *, int_chat_id: int, name: str):
     tid = topic.message_thread_id
     tname = topic.name
 
-    probe_text = f"✨ Topic created: {tname}"
+    probe_text = f"✨ Topic created: {tname}\n{_build_create_topic_context(tname)}"
 
     async def _probe(thread_id: int):
         await _with_retry(lambda: bot.send_message(
