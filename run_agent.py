@@ -5075,8 +5075,9 @@ class AIAgent:
         """Attempt credential recovery via pool rotation.
 
         Returns (recovered, has_retried_429).
-        On rate limits: first occurrence retries same credential (sets flag True).
-                        second consecutive failure rotates to next credential.
+        On rate limits: defaults to retry-same-first (sets flag True), but
+                        openai-codex rotates immediately when multiple stored
+                        credentials exist.
         On billing exhaustion: immediately rotates.
         On auth failures: attempts token refresh before rotating.
 
@@ -5113,7 +5114,18 @@ class AIAgent:
             return False, has_retried_429
 
         if effective_reason == FailoverReason.rate_limit:
-            if not has_retried_429:
+            # For openai-codex with multiple stored credentials, rotating on the
+            # first 429 reduces wasted retries on already-throttled credentials.
+            codex_multi_auth = False
+            if self.provider == "openai-codex":
+                try:
+                    entries_fn = getattr(pool, "entries", None)
+                    if callable(entries_fn):
+                        codex_multi_auth = len(entries_fn() or []) > 1
+                except Exception:
+                    codex_multi_auth = False
+
+            if not has_retried_429 and not codex_multi_auth:
                 return False, True
             rotate_status = status_code if status_code is not None else 429
             next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)

@@ -3057,12 +3057,16 @@ class TestCredentialPoolRecovery:
         assert retry_same is False
         agent._swap_credential.assert_called_once_with(next_entry)
 
-    def test_recover_with_pool_retries_first_429_then_rotates(self, agent):
+    def test_recover_with_pool_retries_first_429_then_rotates_for_non_codex(self, agent):
         next_entry = SimpleNamespace(label="secondary")
+        agent.provider = "openrouter"
 
         class _Pool:
             def current(self):
                 return SimpleNamespace(label="primary")
+
+            def entries(self):
+                return [SimpleNamespace(id="one"), SimpleNamespace(id="two")]
 
             def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
                 assert status_code == 429
@@ -3083,6 +3087,33 @@ class TestCredentialPoolRecovery:
         recovered, retry_same = agent._recover_with_credential_pool(
             status_code=429,
             has_retried_429=True,
+        )
+        assert recovered is True
+        assert retry_same is False
+        agent._swap_credential.assert_called_once_with(next_entry)
+
+    def test_recover_with_pool_codex_rotates_on_first_429_when_multiple_credentials(self, agent):
+        next_entry = SimpleNamespace(label="secondary")
+        agent.provider = "openai-codex"
+
+        class _Pool:
+            def current(self):
+                return SimpleNamespace(label="primary")
+
+            def entries(self):
+                return [SimpleNamespace(id="one"), SimpleNamespace(id="two")]
+
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+                assert status_code == 429
+                assert error_context is None
+                return next_entry
+
+        agent._credential_pool = _Pool()
+        agent._swap_credential = MagicMock()
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=429,
+            has_retried_429=False,
         )
         assert recovered is True
         assert retry_same is False

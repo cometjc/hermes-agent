@@ -5,7 +5,7 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 ## Development Environment
 
 ```bash
-source venv/bin/activate  # ALWAYS activate before running Python
+source .venv/bin/activate  # ALWAYS activate before running Python
 ```
 
 ## Branch & Worktree Workflow
@@ -586,10 +586,10 @@ is belt-and-suspenders.
 ### Running without the wrapper (only if you must)
 
 If you can't use the wrapper (e.g. on Windows or inside an IDE that shells
-pytest directly), at minimum activate the venv and pass `-n 4`:
+pytest directly), at minimum activate the `.venv` and pass `-n 4`:
 
 ```bash
-source venv/bin/activate
+source .venv/bin/activate
 python -m pytest tests/ -q -n 4
 ```
 
