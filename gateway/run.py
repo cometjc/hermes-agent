@@ -1657,7 +1657,7 @@ class GatewayRunner:
                 except Exception:
                     pass
                 if is_telegram:
-                    await self._set_pending_indicator(adapter, event, "👍")
+                    await self._set_pending_indicator(adapter, event, "⚡")
                 return True
 
             # Steering failed — fall back to queue and mark the session.
@@ -1687,12 +1687,12 @@ class GatewayRunner:
             except Exception:
                 pass
             merge_pending_message_event(adapter._pending_messages, session_key, event)
-            await self._set_pending_indicator(adapter, event, "👎")
+            await self._set_pending_indicator(adapter, event, "😴")
             return True
 
         if is_telegram:
             merge_pending_message_event(adapter._pending_messages, session_key, event)
-            await self._set_pending_indicator(adapter, event, "👎")
+            await self._set_pending_indicator(adapter, event, "😴")
             return True
 
         # Queue path: keep the follow-up for the next turn.
