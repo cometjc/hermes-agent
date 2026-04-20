@@ -58,6 +58,7 @@ class ModelInfo:
     attachment: bool = False       # supports image/file attachments (vision)
     temperature: bool = False
     structured_output: bool = False
+    supports_steering: bool = False
     open_weights: bool = False
 
     # Modalities
@@ -531,16 +532,23 @@ def _parse_model_info(model_id: str, raw: Dict[str, Any], provider_id: str) -> M
     inp = limit.get("input")
     inp_int = int(inp) if isinstance(inp, (int, float)) and inp > 0 else None
 
+    reasoning = bool(raw.get("reasoning", False))
+    tool_call = bool(raw.get("tool_call", False))
+    supports_steering = bool(
+        raw.get("supports_steering", raw.get("steering", tool_call or reasoning))
+    )
+
     return ModelInfo(
         id=model_id,
         name=raw.get("name", "") or model_id,
         family=raw.get("family", "") or "",
         provider_id=provider_id,
-        reasoning=bool(raw.get("reasoning", False)),
-        tool_call=bool(raw.get("tool_call", False)),
+        reasoning=reasoning,
+        tool_call=tool_call,
         attachment=bool(raw.get("attachment", False)),
         temperature=bool(raw.get("temperature", False)),
         structured_output=bool(raw.get("structured_output", False)),
+        supports_steering=supports_steering,
         open_weights=bool(raw.get("open_weights", False)),
         input_modalities=tuple(input_mods) if isinstance(input_mods, list) else (),
         output_modalities=tuple(output_mods) if isinstance(output_mods, list) else (),
