@@ -465,16 +465,14 @@ def _check_unavailable_skill(command_name: str) -> str | None:
     normalized = command_name.lower().replace("_", "-")
     try:
         from tools.skills_tool import _get_disabled_skill_names
-        from agent.skill_utils import get_all_skills_dirs
+        from agent.skill_utils import get_all_skills_dirs, iter_skill_index_files
         disabled = _get_disabled_skill_names()
 
         # Check disabled skills across all dirs (local + external)
         for skills_dir in get_all_skills_dirs():
             if not skills_dir.exists():
                 continue
-            for skill_md in skills_dir.rglob("SKILL.md"):
-                if any(part in ('.git', '.github', '.hub') for part in skill_md.parts):
-                    continue
+            for skill_md in iter_skill_index_files(skills_dir, "SKILL.md"):
                 name = skill_md.parent.name.lower().replace("_", "-")
                 if name == normalized and name in disabled:
                     return (
@@ -487,7 +485,7 @@ def _check_unavailable_skill(command_name: str) -> str | None:
         repo_root = Path(__file__).resolve().parent.parent
         optional_dir = get_optional_skills_dir(repo_root / "optional-skills")
         if optional_dir.exists():
-            for skill_md in optional_dir.rglob("SKILL.md"):
+            for skill_md in iter_skill_index_files(optional_dir, "SKILL.md"):
                 name = skill_md.parent.name.lower().replace("_", "-")
                 if name == normalized:
                     # Build install path: official/<category>/<name>

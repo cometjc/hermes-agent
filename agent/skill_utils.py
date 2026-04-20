@@ -432,7 +432,8 @@ def extract_skill_description(frontmatter: Dict[str, Any]) -> str:
 def iter_skill_index_files(skills_dir: Path, filename: str):
     """Walk skills_dir yielding sorted paths matching *filename*.
 
-    Excludes ``.git``, ``.github``, ``.hub`` directories.
+    Excludes ``.git``, ``.github``, ``.hub`` directories and follows symlinked
+    skill directories so symlink-based skill installs are discoverable.
     """
     matches = []
     for root, dirs, files in os.walk(skills_dir, followlinks=True):
