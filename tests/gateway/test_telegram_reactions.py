@@ -1,13 +1,13 @@
 """Tests for Telegram message reactions tied to processing lifecycle hooks."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
-from gateway.session import SessionSource
+from gateway.session import SessionSource, build_session_key
 
 
 def _make_adapter(**extra_env):
@@ -187,6 +187,25 @@ async def test_on_processing_complete_success_clears_reaction(monkeypatch):
         message_id=456,
         reaction=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_on_processing_complete_clears_current_and_pending_reactions(monkeypatch):
+    """Completion should clear the current and queued/steering reactions together."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter()
+    event = _make_event(chat_id="123", message_id="456")
+    pending_event = _make_event(chat_id="123", message_id="789")
+    adapter._pending_messages = {
+        build_session_key(event.source): pending_event,
+    }
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    assert adapter._bot.set_message_reaction.await_args_list == [
+        call(chat_id=123, message_id=456, reaction=None),
+        call(chat_id=123, message_id=789, reaction=None),
+    ]
 
 
 @pytest.mark.asyncio

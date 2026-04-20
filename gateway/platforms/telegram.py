@@ -3321,7 +3321,32 @@ class TelegramAdapter(BasePlatformAdapter):
         """Remove the in-progress reaction when processing completes."""
         if not self._reactions_enabled():
             return
+
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
         if chat_id and message_id:
             await self._clear_reaction(chat_id, message_id)
+
+        # Telegram busy routing can leave a follow-up message buffered in the
+        # session's pending queue while the current turn is still finishing.
+        # When the turn completes, clear that follow-up reaction too so the
+        # original message and the steering/queue message disappear together.
+        try:
+            from gateway.session import build_session_key
+
+            session_key = build_session_key(
+                event.source,
+                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            )
+            pending_event = getattr(self, "_pending_messages", {}).get(session_key)
+        except Exception:
+            pending_event = None
+
+        if not pending_event:
+            return
+
+        pending_chat_id = getattr(getattr(pending_event, "source", None), "chat_id", None)
+        pending_message_id = getattr(pending_event, "message_id", None)
+        if pending_chat_id and pending_message_id and (pending_chat_id, pending_message_id) != (chat_id, message_id):
+            await self._clear_reaction(pending_chat_id, pending_message_id)
