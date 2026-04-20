@@ -76,6 +76,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Set, Tuple
 
+from agent.skill_utils import iter_skill_index_files
+
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -569,12 +571,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     dirs_to_scan.extend(get_external_skills_dirs())
 
     for scan_dir in dirs_to_scan:
-        for skill_md in scan_dir.rglob("SKILL.md"):
-            if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
-                continue
-
-            skill_dir = skill_md.parent
-
+        for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
             try:
                 content = skill_md.read_text(encoding="utf-8")[:4000]
                 frontmatter, body = _parse_frontmatter(content)
@@ -582,7 +579,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 if not skill_matches_platform(frontmatter):
                     continue
 
-                name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
+                name = frontmatter.get("name", skill_md.parent.name)[:MAX_NAME_LENGTH]
                 if name in seen_names:
                     continue
                 if name in disabled:

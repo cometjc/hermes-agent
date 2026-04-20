@@ -271,13 +271,17 @@ class TestSkillsList:
         assert result["skills"] == []
         assert skills_dir.exists()
 
-    def test_lists_skills(self, tmp_path):
+    def test_lists_symlinked_skills(self, tmp_path):
+        real_root = tmp_path / "real"
+        real_root.mkdir()
+        skill_dir = _make_skill(real_root, "do")
+        (tmp_path / "do").symlink_to(skill_dir, target_is_directory=True)
+
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            _make_skill(tmp_path, "alpha")
-            _make_skill(tmp_path, "beta")
             raw = skills_list()
         result = json.loads(raw)
-        assert result["count"] == 2
+        assert result["count"] == 1
+        assert result["skills"][0]["name"] == "do"
 
     def test_category_filter(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
