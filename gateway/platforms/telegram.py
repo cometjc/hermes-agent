@@ -3276,7 +3276,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
-        return os.getenv("TELEGRAM_REACTIONS", "true").lower() not in ("false", "0", "no")
+        return os.getenv("TELEGRAM_REACTIONS", "false").lower() not in ("false", "0", "no")
 
     async def _set_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Set a single emoji reaction on a Telegram message."""
