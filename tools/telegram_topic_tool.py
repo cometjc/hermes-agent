@@ -48,8 +48,10 @@ TELEGRAM_TOPIC_SCHEMA = {
         "For convenience, action='create' and action='list' may omit target "
         "when running inside a Telegram session; they will default to the current "
         "session chat_id. action='create' also posts a short context note into the "
-        "new topic. A separate action='current_chat_id' returns the current "
-        "session chat/thread context.\n\n"
+        "new topic and accepts optional 'context' / 'launch_agent' fields; when "
+        "launch_agent is omitted it defaults to true, so the kickoff message into "
+        "the new topic can immediately start work. A separate action='current_chat_id' "
+        "returns the current session chat/thread context.\n\n"
         "Errors return a structured 'code' field: 'no_rights', 'topic_not_found', "
         "'chat_not_found', 'topic_closed', or 'unknown'.\n\n"
         "IMPORTANT: action='list' only returns topics observed via incoming "
@@ -77,9 +79,17 @@ TELEGRAM_TOPIC_SCHEMA = {
                 "type": "string",
                 "description": "Topic name (1-128 chars). Required for action='create' and action='rename'.",
             },
+            "context": {
+                "type": "string",
+                "description": "Optional kickoff context to send into the newly-created topic when action='create'.",
+            },
+            "launch_agent": {
+                "type": "boolean",
+                "description": "When true (default), send the kickoff context/probe into the new topic so the gateway starts a fresh agent there.",
+            },
             "confirm": {
                 "type": "boolean",
-                "description": "Required for action='delete' (must be true). Safety guard against accidental deletion.",
+                "description": "Required for action='delete' (must be true) to guard against accidental deletion.",
             },
         },
         "required": ["action"],
@@ -109,9 +119,18 @@ def telegram_topic_tool(args, **_kw):
         name = (args.get("name") or "").strip()
         if not name:
             return tool_error("action='create' requires 'name' (1-128 chars)")
+        context = (args.get("context") or "").strip() or None
+        launch_agent = _coerce_bool(args.get("launch_agent"), default=True)
         if thread_id is not None:
             return tool_error("action='create' target must be 'telegram:<chat_id>' without thread_id")
-        return _handle_write_op("create", chat_id=chat_id, thread_id=None, name=name)
+        return _handle_write_op(
+            "create",
+            chat_id=chat_id,
+            thread_id=None,
+            name=name,
+            context=context,
+            launch_agent=launch_agent,
+        )
 
     # close / reopen / delete / rename all need thread_id
     if thread_id is None:
@@ -148,6 +167,23 @@ def _parse_telegram_target(target: str) -> Tuple[Optional[str], Optional[str], O
     if not is_explicit or not chat_id:
         return None, None, f"Could not parse '{parts[1].strip()}' as telegram chat_id or chat_id:thread_id"
     return chat_id, thread_id, None
+
+
+def _coerce_bool(value, *, default: bool = False) -> bool:
+    """Coerce a tool argument to bool, tolerating strings like 'true'."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "1", "yes", "on"}:
+            return True
+        if text in {"false", "0", "no", "off"}:
+            return False
+    return bool(value)
 
 
 def _get_current_telegram_context() -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
@@ -264,7 +300,7 @@ async def _with_retry(coro_factory, *, attempts: int = 3):
             await asyncio.sleep(delay)
 
 
-async def _create_and_verify_topic(bot, *, int_chat_id: int, name: str):
+async def _create_and_verify_topic(bot, *, int_chat_id: int, name: str, launch_agent: bool = True, context: Optional[str] = None):
     """Create a forum topic and verify the returned thread_id is usable.
 
     Works around an observed flake where ``createForumTopic`` returns
@@ -277,6 +313,8 @@ async def _create_and_verify_topic(bot, *, int_chat_id: int, name: str):
 
     Side benefit: the probe message causes the gateway to observe the topic,
     so it shows up in ``telegram_topic(action='list')`` immediately.
+    When ``launch_agent`` is true and ``context`` is provided, that context is
+    used as the kickoff message so the new thread can immediately start work.
     """
     topic = await _with_retry(
         lambda: bot.create_forum_topic(chat_id=int_chat_id, name=name)
@@ -284,13 +322,15 @@ async def _create_and_verify_topic(bot, *, int_chat_id: int, name: str):
     tid = topic.message_thread_id
     tname = topic.name
 
+    context_text = (context or "").strip()
     probe_text = f"✨ Topic created: {tname}\n{_build_create_topic_context(tname)}"
+    kickoff_text = context_text if (launch_agent and context_text) else probe_text
 
     async def _probe(thread_id: int):
         await _with_retry(lambda: bot.send_message(
             chat_id=int_chat_id,
             message_thread_id=thread_id,
-            text=probe_text,
+            text=kickoff_text,
             disable_notification=True,
         ))
 
@@ -312,10 +352,10 @@ async def _create_and_verify_topic(bot, *, int_chat_id: int, name: str):
         # Probe again; if this fails too, let the error propagate up.
         await _probe(tid)
 
-    return tid, tname
+    return tid, tname, kickoff_text
 
 
-async def _run_topic_op(token: str, op: str, *, chat_id: str, thread_id: Optional[str], name: Optional[str]):
+async def _run_topic_op(token: str, op: str, *, chat_id: str, thread_id: Optional[str], name: Optional[str], launch_agent: bool = True, context: Optional[str] = None):
     """Invoke the underlying python-telegram-bot call for a single op.
 
     Uses ``async with Bot(...)`` so HTTPXRequest lifecycle is managed
@@ -328,8 +368,12 @@ async def _run_topic_op(token: str, op: str, *, chat_id: str, thread_id: Optiona
 
     async with Bot(token=token) as bot:
         if op == "create":
-            tid, tname = await _create_and_verify_topic(
-                bot, int_chat_id=int_chat_id, name=name
+            tid, tname, kickoff_text = await _create_and_verify_topic(
+                bot,
+                int_chat_id=int_chat_id,
+                name=name,
+                launch_agent=launch_agent,
+                context=context,
             )
             return {
                 "success": True,
@@ -338,6 +382,8 @@ async def _run_topic_op(token: str, op: str, *, chat_id: str, thread_id: Optiona
                 "chat_id": chat_id,
                 "thread_id": str(tid),
                 "name": tname,
+                "launch_agent": launch_agent,
+                "kickoff_text": kickoff_text,
             }
 
         int_thread_id = int(thread_id)
@@ -363,7 +409,7 @@ async def _run_topic_op(token: str, op: str, *, chat_id: str, thread_id: Optiona
         }
 
 
-def _handle_write_op(op: str, *, chat_id: str, thread_id: Optional[str], name: Optional[str] = None) -> str:
+def _handle_write_op(op: str, *, chat_id: str, thread_id: Optional[str], name: Optional[str] = None, launch_agent: bool = True, context: Optional[str] = None) -> str:
     """Execute a write op (create/close/reopen/delete/rename) and JSON-encode the result."""
     token, err = _load_telegram_token()
     if err:
@@ -371,7 +417,17 @@ def _handle_write_op(op: str, *, chat_id: str, thread_id: Optional[str], name: O
 
     try:
         from model_tools import _run_async
-        result = _run_async(_run_topic_op(token, op, chat_id=chat_id, thread_id=thread_id, name=name))
+        result = _run_async(
+            _run_topic_op(
+                token,
+                op,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                name=name,
+                launch_agent=launch_agent,
+                context=context,
+            )
+        )
     except ImportError:
         return json.dumps({
             "error": "python-telegram-bot not installed. Run: pip install python-telegram-bot",

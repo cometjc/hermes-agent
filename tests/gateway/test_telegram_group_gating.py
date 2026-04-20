@@ -208,6 +208,16 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     assert __import__("os").environ["TELEGRAM_FREE_RESPONSE_CHATS"] == "-123"
 
 
+def test_telegram_reactions_enabled_by_default(monkeypatch):
+    """Telegram reactions should be on unless explicitly disabled."""
+    from gateway.platforms.telegram import TelegramAdapter
+
+    monkeypatch.delenv("TELEGRAM_REACTIONS", raising=False)
+    adapter = object.__new__(TelegramAdapter)
+
+    assert adapter._reactions_enabled() is True
+
+
 def test_config_bridges_telegram_ignored_threads(monkeypatch, tmp_path):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()

@@ -219,6 +219,7 @@ class TestWriteOps:
         assert result["action"] == "create"
         assert result["thread_id"] == "17585"
         assert result["name"] == "discuss-q3"
+        assert result["launch_agent"] is True
         bot.create_forum_topic.assert_awaited_once_with(chat_id=-1001234567890, name="discuss-q3")
         # Self-verify probe sends a service message to the new topic.
         bot.send_message.assert_awaited_once()
@@ -229,6 +230,30 @@ class TestWriteOps:
         assert "Context:" in probe_kwargs["text"]
         assert "小蟹助手群" in probe_kwargs["text"]
         assert "1981" in probe_kwargs["text"]
+        assert result["launch_agent"] is True
+        assert "Context:" in result["kickoff_text"]
+
+    def test_create_launches_agent_with_context(self, monkeypatch):
+        bot = MagicMock()
+        bot.create_forum_topic = AsyncMock(
+            return_value=SimpleNamespace(message_thread_id=17777, name="research")
+        )
+        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
+        _install_telegram_bot_mock(monkeypatch, bot)
+        _install_gateway_config(monkeypatch)
+
+        result = json.loads(telegram_topic_tool({
+            "action": "create",
+            "target": "telegram:-1001234567890",
+            "name": "research",
+            "context": "Please investigate the outage and report back.",
+            "launch_agent": True,
+        }))
+
+        assert result["success"] is True
+        assert result["launch_agent"] is True
+        assert "investigate the outage" in result["kickoff_text"]
+        assert "investigate the outage" in bot.send_message.await_args.kwargs["text"]
 
     def test_create_retries_once_when_thread_id_is_ghost(self, monkeypatch):
         """First create returns a ghost thread_id that fails probe; retry succeeds."""
