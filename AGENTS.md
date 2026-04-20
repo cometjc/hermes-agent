@@ -703,7 +703,7 @@ is belt-and-suspenders.
 ### Running without the wrapper (only if you must)
 
 If you can't use the wrapper (e.g. on Windows or inside an IDE that shells
-pytest directly), at minimum activate the venv and pass `-n 4`:
+pytest directly), at minimum activate the `.venv` and pass `-n 4`:
 
 ```bash
 source .venv/bin/activate   # or: source venv/bin/activate

@@ -146,16 +146,16 @@ Quick start for contributors — clone and go with `setup-hermes.sh`:
 ```bash
 git clone https://github.com/NousResearch/hermes-agent.git
 cd hermes-agent
-./setup-hermes.sh     # installs uv, creates venv, installs .[all], symlinks ~/.local/bin/hermes
-./hermes              # auto-detects the venv, no need to `source` first
+./setup-hermes.sh     # installs uv, creates .venv, installs .[all], symlinks ~/.local/bin/hermes
+./hermes              # auto-detects the .venv, no need to `source` first
 ```
 
 Manual path (equivalent to the above):
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-uv venv venv --python 3.11
-source venv/bin/activate
+uv venv .venv --python 3.11
+source .venv/bin/activate
 uv pip install -e ".[all,dev]"
 scripts/run_tests.sh
 ```

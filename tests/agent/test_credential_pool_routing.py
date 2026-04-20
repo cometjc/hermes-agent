@@ -139,9 +139,9 @@ class TestEagerFallbackWithPool:
 # ---------------------------------------------------------------------------
 
 class TestPoolRotationCycle:
-    """Verify the retry-same → rotate → exhaust flow in _recover_with_credential_pool."""
+    """Verify non-Codex 429 behavior (retry-same → rotate → exhaust)."""
 
-    def _make_agent_with_pool(self, pool_entries=3):
+    def _make_agent_with_pool(self, pool_entries=3, provider="openrouter"):
         from run_agent import AIAgent
 
         with patch.object(AIAgent, "__init__", lambda self, **kw: None):
@@ -170,6 +170,7 @@ class TestPoolRotationCycle:
         agent._credential_pool = pool
         agent._swap_credential = MagicMock()
         agent.log_prefix = ""
+        agent.provider = provider
 
         return agent, pool, entries
 
@@ -226,9 +227,37 @@ class TestPoolRotationCycle:
         with patch.object(AIAgent, "__init__", lambda self, **kw: None):
             agent = AIAgent()
         agent._credential_pool = None
+        agent.provider = "openrouter"
 
         recovered, has_retried = agent._recover_with_credential_pool(
             status_code=429, has_retried_429=False
         )
         assert recovered is False
         assert has_retried is False
+
+
+class TestCodex429Rotation:
+    """Verify openai-codex with multi-credential pool rotates immediately on 429."""
+
+    def test_first_429_rotates_when_multiple_credentials_exist(self):
+        from run_agent import AIAgent
+
+        with patch.object(AIAgent, "__init__", lambda self, **kw: None):
+            agent = AIAgent()
+
+        entries = [MagicMock(id="cred-0"), MagicMock(id="cred-1")]
+        pool = MagicMock()
+        pool.entries.return_value = entries
+        pool.mark_exhausted_and_rotate.return_value = entries[1]
+        agent._credential_pool = pool
+        agent._swap_credential = MagicMock()
+        agent.provider = "openai-codex"
+
+        recovered, has_retried = agent._recover_with_credential_pool(
+            status_code=429, has_retried_429=False
+        )
+
+        assert recovered is True
+        assert has_retried is False
+        pool.mark_exhausted_and_rotate.assert_called_once_with(status_code=429, error_context=None)
+        agent._swap_credential.assert_called_once_with(entries[1])
