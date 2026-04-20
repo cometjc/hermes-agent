@@ -45,6 +45,10 @@ TELEGRAM_TOPIC_SCHEMA = {
         "Targets use the same format as send_message: "
         "'telegram:<chat_id>' for action='create'/'list', "
         "'telegram:<chat_id>:<thread_id>' for close/reopen/delete/rename.\n\n"
+        "For convenience, action='create' and action='list' may omit target "
+        "when running inside a Telegram session; they will default to the current "
+        "session chat_id. A separate action='current_chat_id' returns the current "
+        "session chat/thread context.\n\n"
         "Errors return a structured 'code' field: 'no_rights', 'topic_not_found', "
         "'chat_not_found', 'topic_closed', or 'unknown'.\n\n"
         "IMPORTANT: action='list' only returns topics observed via incoming "
@@ -56,14 +60,15 @@ TELEGRAM_TOPIC_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["create", "close", "reopen", "delete", "rename", "list"],
+                "enum": ["create", "close", "reopen", "delete", "rename", "list", "current_chat_id"],
                 "description": "Topic operation to perform.",
             },
             "target": {
                 "type": "string",
                 "description": (
                     "Target in 'telegram:<chat_id>[:<thread_id>]' form. "
-                    "create/list omit thread_id; close/reopen/delete/rename require it. "
+                    "create/list may omit target to use the current Telegram session; "
+                    "close/reopen/delete/rename require an explicit thread target. "
                     "Example: 'telegram:-1001234567890' or 'telegram:-1001234567890:17585'."
                 ),
             },
@@ -76,7 +81,7 @@ TELEGRAM_TOPIC_SCHEMA = {
                 "description": "Required for action='delete' (must be true). Safety guard against accidental deletion.",
             },
         },
-        "required": ["action", "target"],
+        "required": ["action"],
     },
 }
 
@@ -84,12 +89,15 @@ TELEGRAM_TOPIC_SCHEMA = {
 def telegram_topic_tool(args, **_kw):
     """Dispatch a telegram_topic call to the right action handler."""
     action = (args.get("action") or "").strip().lower()
-    target = args.get("target", "")
+    target = args.get("target")
 
-    if action not in {"create", "close", "reopen", "delete", "rename", "list"}:
-        return tool_error(f"Unknown action '{action}'. Use one of: create, close, reopen, delete, rename, list.")
+    if action not in {"create", "close", "reopen", "delete", "rename", "list", "current_chat_id"}:
+        return tool_error(f"Unknown action '{action}'. Use one of: create, close, reopen, delete, rename, list, current_chat_id.")
 
-    chat_id, thread_id, err = _parse_telegram_target(target)
+    if action == "current_chat_id":
+        return _handle_current_chat_id()
+
+    chat_id, thread_id, err = _resolve_topic_target(action, target)
     if err:
         return tool_error(err)
 
@@ -139,6 +147,54 @@ def _parse_telegram_target(target: str) -> Tuple[Optional[str], Optional[str], O
     if not is_explicit or not chat_id:
         return None, None, f"Could not parse '{parts[1].strip()}' as telegram chat_id or chat_id:thread_id"
     return chat_id, thread_id, None
+
+
+def _get_current_telegram_context() -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Read the current Telegram session context from gateway session vars."""
+    from gateway.session_context import get_session_env
+
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "").strip() or None
+    chat_name = get_session_env("HERMES_SESSION_CHAT_NAME", "").strip() or None
+
+    if platform and platform != "telegram":
+        return None, None, None, f"Current session is '{platform}', not telegram"
+    if not chat_id:
+        return None, None, None, "No current Telegram chat id is available in this session context"
+    return chat_id, thread_id, chat_name, None
+
+
+def _resolve_topic_target(action: str, target: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Resolve an explicit target or fall back to the current Telegram session."""
+    if target:
+        return _parse_telegram_target(target)
+
+    if action in {"create", "list"}:
+        chat_id, thread_id, _chat_name, err = _get_current_telegram_context()
+        if err:
+            return None, None, err
+        if action == "create":
+            return chat_id, None, None
+        return chat_id, thread_id, None
+
+    return None, None, "'target' is required"
+
+
+def _handle_current_chat_id() -> str:
+    """Return the current Telegram chat/thread context as JSON."""
+    chat_id, thread_id, chat_name, err = _get_current_telegram_context()
+    if err:
+        return tool_error(err)
+    from gateway.session_context import get_session_env
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower() or "telegram"
+    return json.dumps({
+        "success": True,
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "chat_name": chat_name,
+    })
 
 
 def _load_telegram_token() -> Tuple[Optional[str], Optional[str]]:

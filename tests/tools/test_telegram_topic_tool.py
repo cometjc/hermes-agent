@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from gateway.session_context import clear_session_vars, set_session_vars
 from tools.telegram_topic_tool import (
     _classify_error,
     _parse_telegram_target,
@@ -113,6 +114,56 @@ class TestValidation:
     def test_unknown_action(self):
         result = json.loads(telegram_topic_tool({"action": "nuke", "target": "telegram:-100"}))
         assert "error" in result and "Unknown action" in result["error"]
+
+    def test_current_chat_id_reports_session_context(self, monkeypatch):
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="-1003837358001",
+            thread_id="1981",
+            chat_name="小蟹助手群",
+        )
+        try:
+            result = json.loads(telegram_topic_tool({"action": "current_chat_id"}))
+        finally:
+            clear_session_vars(tokens)
+
+        assert result["success"] is True
+        assert result["platform"] == "telegram"
+        assert result["chat_id"] == "-1003837358001"
+        assert result["thread_id"] == "1981"
+        assert result["chat_name"] == "小蟹助手群"
+
+    def test_create_defaults_to_current_chat_id_when_target_is_missing(self, monkeypatch):
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="-1003837358001",
+            thread_id="1981",
+        )
+        try:
+            bot = MagicMock()
+            bot.create_forum_topic = AsyncMock(
+                return_value=SimpleNamespace(message_thread_id=17585, name="debug-topic")
+            )
+            bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
+            _install_telegram_bot_mock(monkeypatch, bot)
+            _install_gateway_config(monkeypatch)
+
+            result = json.loads(telegram_topic_tool({"action": "create", "name": "debug-topic"}))
+        finally:
+            clear_session_vars(tokens)
+
+        assert result["success"] is True
+        assert result["chat_id"] == "-1003837358001"
+        assert result["thread_id"] == "17585"
+        bot.create_forum_topic.assert_awaited_once_with(chat_id=-1003837358001, name="debug-topic")
+
+    def test_create_requires_session_context_when_target_is_missing(self, monkeypatch):
+        clear_session_vars(set_session_vars())
+
+        result = json.loads(telegram_topic_tool({"action": "create", "name": "debug-topic"}))
+
+        assert "error" in result
+        assert "current telegram chat" in result["error"].lower()
 
     def test_create_requires_name(self):
         result = json.loads(telegram_topic_tool({"action": "create", "target": "telegram:-100"}))
@@ -399,5 +450,5 @@ class TestSchemaRegistration:
         assert entry.toolset == "messaging"
         assert entry.schema["name"] == "telegram_topic"
         assert set(entry.schema["parameters"]["properties"]["action"]["enum"]) == {
-            "create", "close", "reopen", "delete", "rename", "list",
+            "create", "close", "reopen", "delete", "rename", "list", "current_chat_id",
         }
