@@ -8,6 +8,7 @@ from agent.models_dev import (
     _extract_context,
     fetch_models_dev,
     get_model_capabilities,
+    get_model_info,
     lookup_models_dev_context,
 )
 
@@ -343,3 +344,47 @@ class TestGetModelCapabilities:
         with patch("agent.models_dev.fetch_models_dev", return_value=CAPS_REGISTRY):
             caps = get_model_capabilities("anthropic", "nonexistent-model")
         assert caps is None
+
+
+class TestGetModelInfo:
+    """Tests for get_model_info rich dataclass behavior."""
+
+    def test_format_capabilities_does_not_crash_without_explicit_steering_flag(self):
+        registry = {
+            "openai": {
+                "id": "openai",
+                "models": {
+                    "gpt-5.4": {
+                        "id": "gpt-5.4",
+                        "tool_call": True,
+                        "reasoning": True,
+                        "limit": {"context": 272000, "output": 32000},
+                    },
+                },
+            },
+        }
+        with patch("agent.models_dev.fetch_models_dev", return_value=registry):
+            info = get_model_info("openai-codex", "gpt-5.4")
+        assert info is not None
+        caps = info.format_capabilities()
+        assert "tools" in caps
+        assert "reasoning" in caps
+
+    def test_format_capabilities_includes_steering_when_explicitly_enabled(self):
+        registry = {
+            "openai": {
+                "id": "openai",
+                "models": {
+                    "gpt-5.4": {
+                        "id": "gpt-5.4",
+                        "tool_call": True,
+                        "supports_steering": True,
+                        "limit": {"context": 272000, "output": 32000},
+                    },
+                },
+            },
+        }
+        with patch("agent.models_dev.fetch_models_dev", return_value=registry):
+            info = get_model_info("openai-codex", "gpt-5.4")
+        assert info is not None
+        assert "steering" in info.format_capabilities()

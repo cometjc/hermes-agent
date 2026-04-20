@@ -719,11 +719,44 @@ class TestBuildSystemPrompt:
         prompt = agent_with_memory_tool._build_system_prompt()
         assert MEMORY_GUIDANCE in prompt
 
+    def test_mempalace_guidance_when_mcp_tools_loaded(self):
+        from agent.prompt_builder import MEMPALACE_SESSION_RECALL_GUIDANCE
+
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs(
+                    "web_search",
+                    "mcp_mempalace_search_memories",
+                    "mcp_mempalace_recall_entity",
+                ),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent_with_mempalace = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            agent_with_mempalace.client = MagicMock()
+
+        prompt = agent_with_mempalace._build_system_prompt()
+        assert MEMPALACE_SESSION_RECALL_GUIDANCE in prompt
+
     def test_no_memory_guidance_without_tool(self, agent):
         from agent.prompt_builder import MEMORY_GUIDANCE
 
         prompt = agent._build_system_prompt()
         assert MEMORY_GUIDANCE not in prompt
+
+    def test_no_mempalace_guidance_without_mcp_tools(self, agent):
+        from agent.prompt_builder import MEMPALACE_SESSION_RECALL_GUIDANCE
+
+        prompt = agent._build_system_prompt()
+        assert MEMPALACE_SESSION_RECALL_GUIDANCE not in prompt
 
     def test_includes_datetime(self, agent):
         prompt = agent._build_system_prompt()

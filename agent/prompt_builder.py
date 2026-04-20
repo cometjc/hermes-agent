@@ -167,6 +167,17 @@ SESSION_SEARCH_GUIDANCE = (
     "asking them to repeat themselves."
 )
 
+MEMPALACE_SESSION_RECALL_GUIDANCE = (
+    "When the user asks about historical session data, prior decisions, remembered "
+    "entities, or 'what did we do before', prefer the MemPalace MCP tools if they "
+    "are available. Use mcp_mempalace_search_memories for semantic recall, "
+    "mcp_mempalace_recall_entity for people/projects/concepts, "
+    "mcp_mempalace_list_wings and mcp_mempalace_list_rooms_in_wing to navigate the "
+    "memory structure, and mcp_mempalace_read_drawer for targeted readback. Use the "
+    "built-in session_search tool as a fallback for exact keyword lookup or recent "
+    "session listing when MemPalace does not surface the answer."
+)
+
 SKILLS_GUIDANCE = (
     "After completing a complex task (5+ tool calls), fixing a tricky error, "
     "or discovering a non-trivial workflow, save the approach as a "
