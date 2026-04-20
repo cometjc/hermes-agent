@@ -160,6 +160,21 @@ uv pip install -e ".[all,dev]"
 python -m pytest tests/ -q
 ```
 
+Direnv workflow (uv-first, with Nix fallback):
+
+```bash
+direnv allow
+```
+
+- Default behavior uses `uv` with a local `.venv` for faster shell entry after source changes.
+- Switch back to Nix shell for this session with:
+  ```bash
+  export HERMES_ENV_BACKEND=nix
+  direnv reload
+  ```
+- Dependency sync (`uv sync --all-extras --frozen`) only re-runs when lock inputs change:
+  `pyproject.toml`, `uv.lock`, `ui-tui/package.json`, or `ui-tui/package-lock.json`.
+
 > **RL Training (optional):** To work on the RL/Tinker-Atropos integration:
 > ```bash
 > git submodule update --init tinker-atropos
