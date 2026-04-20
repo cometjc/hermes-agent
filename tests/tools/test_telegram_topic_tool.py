@@ -235,6 +235,7 @@ class TestWriteOps:
 
     def test_create_launches_agent_with_context(self, monkeypatch):
         bot = MagicMock()
+        bot.username = "HermesBot"
         bot.create_forum_topic = AsyncMock(
             return_value=SimpleNamespace(message_thread_id=17777, name="research")
         )
@@ -253,7 +254,8 @@ class TestWriteOps:
         assert result["success"] is True
         assert result["launch_agent"] is True
         assert "investigate the outage" in result["kickoff_text"]
-        assert "investigate the outage" in bot.send_message.await_args.kwargs["text"]
+        assert "@HermesBot" in result["kickoff_text"]
+        assert bot.send_message.await_args.kwargs["text"].startswith("@HermesBot")
 
     def test_create_retries_once_when_thread_id_is_ghost(self, monkeypatch):
         """First create returns a ghost thread_id that fails probe; retry succeeds."""

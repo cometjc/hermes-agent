@@ -300,6 +300,23 @@ async def _with_retry(coro_factory, *, attempts: int = 3):
             await asyncio.sleep(delay)
 
 
+async def _resolve_bot_username(bot) -> Optional[str]:
+    """Best-effort resolve the bot username for mention-based wakeups."""
+    username = (getattr(bot, "username", None) or "").strip().lstrip("@")
+    if username:
+        return username
+    getter = getattr(bot, "get_me", None)
+    if callable(getter):
+        try:
+            me = await getter()
+            username = (getattr(me, "username", None) or "").strip().lstrip("@")
+            if username:
+                return username
+        except Exception:
+            return None
+    return None
+
+
 async def _create_and_verify_topic(bot, *, int_chat_id: int, name: str, launch_agent: bool = True, context: Optional[str] = None):
     """Create a forum topic and verify the returned thread_id is usable.
 
@@ -324,7 +341,15 @@ async def _create_and_verify_topic(bot, *, int_chat_id: int, name: str, launch_a
 
     context_text = (context or "").strip()
     probe_text = f"✨ Topic created: {tname}\n{_build_create_topic_context(tname)}"
-    kickoff_text = context_text if (launch_agent and context_text) else probe_text
+    kickoff_text = probe_text
+    if launch_agent:
+        if context_text:
+            kickoff_text = context_text
+        # Prepend a bot mention so the Telegram gateway wakes up even when
+        # mention-requirement mode is enabled.
+        bot_username = await _resolve_bot_username(bot)
+        if bot_username:
+            kickoff_text = f"@{bot_username} {kickoff_text}".strip()
 
     async def _probe(thread_id: int):
         await _with_retry(lambda: bot.send_message(
