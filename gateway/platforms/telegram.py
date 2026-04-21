@@ -8,12 +8,12 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
-import concurrent.futures
-import itertools
 import json
 import logging
 import os
+import shutil
 import tempfile
+import subprocess
 import html as _html
 import re
 from typing import Dict, List, Optional, Any
@@ -124,12 +124,11 @@ def _strip_mdv2(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Markdown table → formatted code block conversion
+# Markdown table → SVG conversion
 # ---------------------------------------------------------------------------
-# Telegram's MarkdownV2 has no table syntax — '|' is just an escaped literal,
-# so pipe tables render as noisy backslash-pipe text with no alignment.
-# We detect GFM-style tables and re-render them as a fenced code block with
-# padded columns, which preserves readability in Telegram.
+# Telegram's MarkdownV2 has no table syntax — pipe tables render as noisy
+# backslash-pipe text.  For Telegram delivery we detect GFM-style pipe tables,
+# render them through Mermaid CLI as SVG, and send the SVG as an attachment.
 
 # Matches a GFM table delimiter row: optional outer pipes, cells containing
 # only dashes (with optional leading/trailing colons for alignment) separated
@@ -140,138 +139,136 @@ _TABLE_SEPARATOR_RE = re.compile(
 )
 
 
-def _split_markdown_table_row(line: str) -> list[str] | None:
-    """Split a potential pipe-table row into stripped cells."""
+def _split_markdown_table_row(line: str) -> list[str]:
+    """Split a Markdown pipe-table row into trimmed cells."""
     stripped = line.strip()
     if not stripped or '|' not in stripped:
-        return None
-
-    parts = stripped.split('|')
-    if stripped.startswith('|'):
-        parts = parts[1:]
-    if stripped.endswith('|'):
-        parts = parts[:-1]
-
-    cells = [part.strip() for part in parts]
-    if len(cells) < 2:
-        return None
-    return cells
+        return []
+    cells = [cell.strip() for cell in stripped.strip('|').split('|')]
+    return [cell for cell in cells if cell is not None]
 
 
-def _is_table_row(line: str, expected_columns: int | None = None) -> bool:
-    """Return True if *line* could plausibly be a table data row."""
+def _looks_like_markdown_table_row(line: str, expected_columns: Optional[int] = None) -> bool:
     cells = _split_markdown_table_row(line)
-    if not cells:
-        return False
-    if expected_columns is not None and len(cells) != expected_columns:
-        return False
-    return True
+    return bool(cells) and (expected_columns is None or len(cells) == expected_columns)
 
 
 def _display_width(text: str) -> int:
-    """Return the monospace display width of *text*.
-
-    East Asian full-width / wide characters count as 2 columns so Chinese
-    tables stay aligned when rendered in Telegram's code blocks.
-    """
-    import unicodedata
-
     width = 0
-    for ch in text:
-        if unicodedata.combining(ch):
+    for char in text:
+        if _html.unescape(char) == char and char == '\u200b':
             continue
-        width += 2 if unicodedata.east_asian_width(ch) in {"F", "W"} else 1
+        if _html.unescape(char) != char:
+            # HTML entities are treated as their rendered characters before width calc.
+            char = _html.unescape(char)
+        if not char:
+            continue
+        if ord(char) < 32:
+            continue
+        import unicodedata as _unicodedata
+        if _unicodedata.combining(char):
+            continue
+        if _unicodedata.east_asian_width(char) in {'F', 'W'}:
+            width += 2
+        else:
+            width += 1
     return width
 
 
-def _pad_display(text: str, width: int, *, align: str = "left") -> str:
-    """Pad *text* to a target display *width* using spaces."""
-    pad = max(width - _display_width(text), 0)
-    if align == "right":
-        return (" " * pad) + text
-    if align == "center":
-        left = pad // 2
-        right = pad - left
-        return (" " * left) + text + (" " * right)
-    return text + (" " * pad)
+def _pad_cell(cell: str, width: int) -> str:
+    pad = max(0, width - _display_width(cell))
+    return cell + (' ' * pad)
 
 
-def _separator_alignment(cell: str) -> str:
-    """Return the alignment hint encoded in a markdown separator cell."""
-    cell = cell.strip()
-    if cell.startswith(":") and cell.endswith(":"):
-        return "center"
-    if cell.startswith(":"):
-        return "left"
-    if cell.endswith(":"):
-        return "right"
-    return "left"
+def _markdown_table_to_mermaid_svg_source(table_lines: list[str]) -> str:
+    headers = _split_markdown_table_row(table_lines[0])
+    rows = [_split_markdown_table_row(line) for line in table_lines[2:]]
+    widths = [0] * len(headers)
+    for idx, cell in enumerate(headers):
+        widths[idx] = max(widths[idx], _display_width(cell))
+    for row in rows:
+        for idx, cell in enumerate(row):
+            widths[idx] = max(widths[idx], _display_width(cell))
+
+    def _render_row(cells: list[str], header: bool = False) -> str:
+        padded = [_pad_cell(cell, widths[idx]) for idx, cell in enumerate(cells)]
+        tag = 'th' if header else 'td'
+        return ''.join(
+            f"<{tag} style='padding: 4px 10px; border: 1px solid #c8ccd0; text-align: left;"
+            f" white-space: pre;'>{_html.escape(cell)}</{tag}>"
+            for cell in padded
+        )
+
+    html_table = [
+        "<table style='border-collapse: collapse; background: transparent; font-family: monospace; color: #111;'>",
+        f'  <thead><tr>{_render_row(headers, header=True)}</tr></thead>',
+        '  <tbody>',
+    ]
+    for row in rows:
+        html_table.append(f'    <tr>{_render_row(row)}</tr>')
+    html_table.extend(['  </tbody>', '</table>'])
+    html_table_src = ''.join(html_table)
+
+    return (
+        "%%{init: {'securityLevel': 'loose', 'theme': 'base', 'flowchart': {'htmlLabels': true}}}%%\n"
+        "flowchart TB\n"
+        f"    T[\"{html_table_src}\"]\n"
+        "    style T fill:transparent,stroke:transparent\n"
+    )
 
 
-def _format_table_block(table_lines: list[str]) -> list[str]:
-    """Format a table block into a visually aligned fenced code block."""
-    header_cells = _split_markdown_table_row(table_lines[0]) or []
-    separator_cells = _split_markdown_table_row(table_lines[1]) or []
-    if len(header_cells) < 2 or len(header_cells) != len(separator_cells):
-        return table_lines
+def _render_markdown_table_svg(table_lines: list[str]) -> Optional[str]:
+    """Render a Markdown pipe table to a temporary SVG via Mermaid CLI."""
+    mmdc = shutil.which('mmdc')
+    if not mmdc:
+        logger.warning("[Telegram] mmdc not found; cannot render Markdown table as SVG")
+        return None
 
-    body_rows: list[list[str]] = []
-    for line in table_lines[2:]:
-        cells = _split_markdown_table_row(line)
-        if not cells or len(cells) != len(header_cells):
-            return table_lines
-        body_rows.append(cells)
-
-    columns = list(zip(header_cells, *body_rows)) if body_rows else [(cell,) for cell in header_cells]
-    widths = [max(_display_width(str(cell)) for cell in column) for column in columns]
-    aligns = [_separator_alignment(cell) for cell in separator_cells]
-
-    def render_row(cells: list[str]) -> str:
-        padded = [
-            _pad_display(cell, width, align=align)
-            for cell, width, align in zip(cells, widths, aligns)
-        ]
-        return "| " + " | ".join(padded) + " |"
-
-    def render_separator() -> str:
-        parts = []
-        for width, align in zip(widths, aligns):
-            dash_count = max(width, 3)
-            if align == "center":
-                parts.append(":" + "-" * dash_count + ":")
-            elif align == "right":
-                parts.append("-" * dash_count + ":")
-            elif align == "left":
-                parts.append(":" + "-" * dash_count)
-            else:
-                parts.append("-" * dash_count)
-        return "|" + "|".join(parts) + "|"
-
-    formatted = [render_row(header_cells), render_separator()]
-    formatted.extend(render_row(row) for row in body_rows)
-    return ["```", *formatted, "```"]
+    mermaid_source = _markdown_table_to_mermaid_svg_source(table_lines)
+    mmd_fd, mmd_path = tempfile.mkstemp(prefix='hermes-table-', suffix='.mmd')
+    svg_fd, svg_path = tempfile.mkstemp(prefix='hermes-table-', suffix='.svg')
+    os.close(mmd_fd)
+    os.close(svg_fd)
+    try:
+        with open(mmd_path, 'w', encoding='utf-8') as fh:
+            fh.write(mermaid_source)
+        result = subprocess.run(
+            [mmdc, '-i', mmd_path, '-o', svg_path, '-b', 'transparent'],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "[Telegram] mmdc failed rendering Markdown table to SVG: %s",
+                (result.stderr or result.stdout or '').strip(),
+            )
+            return None
+        if not os.path.exists(svg_path) or os.path.getsize(svg_path) == 0:
+            logger.warning("[Telegram] mmdc finished but produced no SVG output")
+            return None
+        return svg_path
+    finally:
+        try:
+            os.remove(mmd_path)
+        except OSError:
+            pass
 
 
-def _wrap_markdown_tables(text: str) -> str:
-    """Wrap GFM-style pipe tables in ``` fences so Telegram renders them.
-
-    Detected by a row containing '|' immediately followed by a delimiter
-    row matching :data:`_TABLE_SEPARATOR_RE`.  Subsequent table rows must
-    have the same number of cells; otherwise the original text is left
-    untouched.  Tables inside existing fenced code blocks are left alone.
-    """
+def _extract_markdown_table_blocks(text: str) -> tuple[list[str], str]:
+    """Extract Markdown pipe tables from *text* and render them as SVG files."""
     if '|' not in text or '-' not in text:
-        return text
+        return [], text
 
     lines = text.split('\n')
     out: list[str] = []
+    svgs: list[str] = []
     in_fence = False
     i = 0
     while i < len(lines):
         line = lines[i]
         stripped = line.lstrip()
 
-        # Track existing fenced code blocks — never touch content inside.
         if stripped.startswith('```'):
             in_fence = not in_fence
             out.append(line)
@@ -282,35 +279,40 @@ def _wrap_markdown_tables(text: str) -> str:
             i += 1
             continue
 
-        # Look for a header row (contains '|') immediately followed by a
-        # delimiter row.
-        header_cells = _split_markdown_table_row(line)
-        if (
-            header_cells
-            and i + 1 < len(lines)
-            and _TABLE_SEPARATOR_RE.match(lines[i + 1])
-        ):
+        if '|' in line and i + 1 < len(lines) and _TABLE_SEPARATOR_RE.match(lines[i + 1]):
+            header_cells = _split_markdown_table_row(line)
             separator_cells = _split_markdown_table_row(lines[i + 1])
-            if not separator_cells or len(separator_cells) != len(header_cells):
+            if len(header_cells) < 2 or len(header_cells) != len(separator_cells):
                 out.append(line)
                 i += 1
                 continue
 
             table_block = [line, lines[i + 1]]
             j = i + 2
-            while j < len(lines) and _is_table_row(lines[j], expected_columns=len(header_cells)):
-                table_block.append(lines[j])
+            while j < len(lines):
+                row = lines[j]
+                if not row.strip():
+                    break
+                if not _looks_like_markdown_table_row(row, len(header_cells)):
+                    break
+                table_block.append(row)
                 j += 1
 
-            formatted_block = _format_table_block(table_block)
-            out.extend(formatted_block)
-            i = j
-            continue
+            if len(table_block) < 3:
+                out.append(line)
+                i += 1
+                continue
+
+            svg_path = _render_markdown_table_svg(table_block)
+            if svg_path:
+                svgs.append(svg_path)
+                i = j
+                continue
 
         out.append(line)
         i += 1
 
-    return '\n'.join(out)
+    return svgs, '\n'.join(out)
 
 
 class TelegramAdapter(BasePlatformAdapter):
@@ -365,12 +367,13 @@ class TelegramAdapter(BasePlatformAdapter):
         self._model_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
-        # Pending steer reactions that should be cleared when the turn ends.
-        self._pending_steer_reactions: Dict[str, list[tuple[str, str]]] = {}
-        # Clarify prompt state: clarify_id → pending request metadata
-        self._clarify_pending: Dict[str, dict] = {}
-        self._clarify_counter = itertools.count(1)
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def extract_media(self, content: str):
+        """Extract explicit MEDIA tags and auto-render Markdown tables as SVG files."""
+        media_files, cleaned = super().extract_media(content)
+        table_svgs, cleaned = _extract_markdown_table_blocks(cleaned)
+        media_files.extend((svg_path, False) for svg_path in table_svgs)
+        return media_files, cleaned
 
     @staticmethod
     def _is_callback_user_authorized(user_id: str) -> bool:
@@ -380,183 +383,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or user_id in allowed_ids
-
-    def build_clarify_callback(
-        self,
-        *,
-        chat_id: str,
-        thread_id: Optional[str],
-        user_id: str,
-    ):
-        """Build a blocking clarify(question, choices) callback for AIAgent.
-
-        The returned callable runs in the agent worker thread, sends a Telegram
-        inline keyboard on the gateway loop, then blocks until the matching
-        ``clr:`` callback query resolves the pending Future.
-        """
-
-        def _clarify(question: str, choices: Optional[list[str]] = None) -> str:
-            if not self._bot:
-                return "Clarify is not available: Telegram is not connected."
-            if not self._loop or self._loop.is_closed():
-                return "Clarify is not available in this execution context."
-
-            clean_choices = [str(c).strip() for c in (choices or []) if str(c).strip()][:4]
-            if not clean_choices:
-                return "Clarify is not available in this execution context."
-
-            clarify_id = f"cl-{next(self._clarify_counter)}"
-            response_future: concurrent.futures.Future[str] = concurrent.futures.Future()
-
-            send_future = asyncio.run_coroutine_threadsafe(
-                self._send_clarify_prompt(
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    clarify_id=clarify_id,
-                    question=question,
-                    choices=clean_choices,
-                ),
-                self._loop,
-            )
-
-            try:
-                send_result = send_future.result(timeout=30)
-            except Exception as exc:
-                return f"Failed to send clarify prompt: {exc}"
-
-            if not send_result or not send_result.success:
-                return f"Failed to send clarify prompt: {getattr(send_result, 'error', 'unknown error')}"
-
-            self._clarify_pending[clarify_id] = {
-                "future": response_future,
-                "user_id": str(user_id),
-                "chat_id": str(chat_id),
-                "thread_id": str(thread_id) if thread_id is not None else None,
-                "message_id": str(send_result.message_id) if send_result.message_id is not None else None,
-                "choices": clean_choices,
-            }
-
-            timeout_s = float(os.getenv("HERMES_TELEGRAM_CLARIFY_TIMEOUT", "120"))
-            timeout_message = (
-                "The user did not provide a response within the time limit. "
-                "Use your best judgement to make the choice and proceed."
-            )
-
-            try:
-                return response_future.result(timeout=timeout_s)
-            except concurrent.futures.TimeoutError:
-                pending = self._clarify_pending.pop(clarify_id, None)
-                if pending and pending.get("message_id"):
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            self._clear_clarify_markup(
-                                chat_id=chat_id,
-                                message_id=str(pending["message_id"]),
-                                thread_id=thread_id,
-                            ),
-                            self._loop,
-                        )
-                    except Exception:
-                        pass
-                return timeout_message
-            finally:
-                self._clarify_pending.pop(clarify_id, None)
-
-        return _clarify
-
-    async def _send_clarify_prompt(
-        self,
-        *,
-        chat_id: str,
-        thread_id: Optional[str],
-        clarify_id: str,
-        question: str,
-        choices: list[str],
-    ) -> SendResult:
-        if not self._bot:
-            return SendResult(success=False, error="Not connected")
-
-        rows = [[InlineKeyboardButton(label, callback_data=f"clr:{clarify_id}:{idx}")]
-                for idx, label in enumerate(choices)]
-        keyboard = InlineKeyboardMarkup(rows)
-        kwargs: Dict[str, Any] = {
-            "chat_id": int(chat_id),
-            "text": f"❓ {question}",
-            "reply_markup": keyboard,
-            **self._link_preview_kwargs(),
-        }
-        message_thread_id = self._message_thread_id_for_send(thread_id)
-        if message_thread_id is not None:
-            kwargs["message_thread_id"] = message_thread_id
-        msg = await self._bot.send_message(**kwargs)
-        return SendResult(success=True, message_id=str(msg.message_id))
-
-    async def _clear_clarify_markup(
-        self,
-        *,
-        chat_id: str,
-        message_id: str,
-        thread_id: Optional[str],
-    ) -> None:
-        if not self._bot:
-            return
-        kwargs: Dict[str, Any] = {
-            "chat_id": int(chat_id),
-            "message_id": int(message_id),
-            "reply_markup": None,
-        }
-        message_thread_id = self._message_thread_id_for_send(thread_id)
-        if message_thread_id is not None:
-            kwargs["message_thread_id"] = message_thread_id
-        try:
-            await self._bot.edit_message_reply_markup(**kwargs)
-        except Exception:
-            pass
-
-    async def _handle_clarify_callback(self, query, data: str) -> None:
-        parts = data.split(":", 2)
-        if len(parts) != 3:
-            await query.answer(text="Invalid clarify data.")
-            return
-
-        clarify_id = parts[1]
-        try:
-            choice_idx = int(parts[2])
-        except ValueError:
-            await query.answer(text="Invalid clarify choice.")
-            return
-
-        pending = self._clarify_pending.get(clarify_id)
-        if not pending:
-            await query.answer(text="This clarify request has already been resolved.")
-            return
-
-        caller_id = str(getattr(query.from_user, "id", ""))
-        expected_user_id = str(pending.get("user_id", ""))
-        if expected_user_id and caller_id != expected_user_id:
-            await query.answer(text="⛔ You are not authorized to answer this clarification.")
-            return
-
-        choices = pending.get("choices") or []
-        if choice_idx < 0 or choice_idx >= len(choices):
-            await query.answer(text="Invalid clarify choice.")
-            return
-
-        choice = choices[choice_idx]
-        future = pending.get("future")
-        if future and not future.done():
-            future.set_result(choice)
-
-        self._clarify_pending.pop(clarify_id, None)
-
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        try:
-            await query.answer(text=f"Selected: {choice}")
-        except Exception:
-            pass
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -1085,7 +911,6 @@ class TelegramAdapter(BasePlatformAdapter):
 
             # Decide between webhook and polling mode
             webhook_url = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
-            self._loop = asyncio.get_running_loop()
 
             if webhook_url:
                 # ── Webhook mode ─────────────────────────────────────
@@ -1140,7 +965,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     await delete_webhook(drop_pending_updates=False)
 
                 loop = asyncio.get_running_loop()
-                self._loop = loop
 
                 def _polling_error_callback(error: Exception) -> None:
                     if self._polling_error_task and not self._polling_error_task.done():
@@ -1971,11 +1795,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.error("Failed to resolve gateway approval from Telegram button: %s", exc)
             return
 
-        # --- Clarify callbacks (clr:<clarify_id>:<choice_index>) ---
-        if data.startswith("clr:"):
-            await self._handle_clarify_callback(query, data)
-            return
-
         # --- Update prompt callbacks ---
         if not data.startswith("update_prompt:"):
             return
@@ -2358,13 +2177,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         text = content
 
-        # 0) Pre-wrap GFM-style pipe tables in ``` fences.  Telegram can't
-        #    render tables natively, but fenced code blocks render as
-        #    monospace preformatted text with columns intact.  The wrapped
-        #    tables then flow through step (1) below as protected regions.
-        text = _wrap_markdown_tables(text)
-
-        # 1) Protect fenced code blocks (``` ... ```)
+        # 0) Protect fenced code blocks (``` ... ```)
         #    Per MarkdownV2 spec, \ and ` inside pre/code must be escaped.
         def _protect_fenced(m):
             raw = m.group(0)
@@ -2659,22 +2472,15 @@ class TelegramAdapter(BasePlatformAdapter):
         - ``require_mention`` is disabled
         - the message replies to the bot
         - the bot is @mentioned
-        - the message matches a configured regex wake-word pattern
-        - the message is the first message of a newly-created forum topic
-          (``forum_topic_created`` service message), so topics opened by
-          forwarding a message kick the bot off immediately
-        - the message is a forward (``forward_origin`` / ``forward_from`` /
-          ``forward_from_chat``), which is the common way users seed a new
-          topic with external context
+        - the text/caption matches a configured regex wake-word pattern
 
         When ``require_mention`` is enabled, slash commands are not given
         special treatment — they must pass the same mention/reply checks
-        as any other group message. Users can still trigger commands via
+        as any other group message.  Users can still trigger commands via
         the Telegram bot menu (``/command@botname``) or by explicitly
         mentioning the bot (``@botname /command``), both of which are
         recognised as mentions by :meth:`_message_mentions_bot`.
         """
-
         if not self._is_group_chat(message):
             return True
         thread_id = getattr(message, "message_thread_id", None)
@@ -2692,21 +2498,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         if self._message_mentions_bot(message):
             return True
-        if self._message_matches_mention_patterns(message):
-            return True
-        # Forum topic kickoff: the first message of a newly-created topic (often
-        # produced by forwarding an external message into a group) should wake
-        # the bot even without an explicit @mention, otherwise users have to
-        # send a second message before the bot acts.
-        if getattr(message, "forum_topic_created", None):
-            return True
-        if (
-            getattr(message, "forward_origin", None)
-            or getattr(message, "forward_from", None)
-            or getattr(message, "forward_from_chat", None)
-        ):
-            return True
-        return False
+        return self._message_matches_mention_patterns(message)
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
@@ -3390,7 +3182,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
-        return os.getenv("TELEGRAM_REACTIONS", "true").lower() not in ("false", "0", "no")
+        return os.getenv("TELEGRAM_REACTIONS", "false").lower() not in ("false", "0", "no")
 
     async def _set_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Set a single emoji reaction on a Telegram message."""
@@ -3407,42 +3199,6 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] set_message_reaction failed (%s): %s", self.name, emoji, e)
             return False
 
-    async def _clear_reaction(self, chat_id: str, message_id: str) -> bool:
-        """Clear reactions from a Telegram message."""
-        return await self._set_reaction(chat_id, message_id, None)
-
-    def remember_pending_steer_reaction(self, session_key: str, event: MessageEvent) -> None:
-        """Remember a Telegram steer reaction so it can be cleared at turn end."""
-        chat_id = getattr(event.source, "chat_id", None)
-        message_id = getattr(event, "message_id", None)
-        if not chat_id or not message_id:
-            return
-        bucket = getattr(self, "_pending_steer_reactions", None)
-        if bucket is None:
-            bucket = {}
-            self._pending_steer_reactions = bucket
-        targets = bucket.setdefault(session_key, [])
-        target = (str(chat_id), str(message_id))
-        if target not in targets:
-            targets.append(target)
-
-    def clear_pending_steer_reactions(self, session_key: str) -> None:
-        """Forget any steer reactions queued for this session."""
-        bucket = getattr(self, "_pending_steer_reactions", None)
-        if isinstance(bucket, dict):
-            bucket.pop(session_key, None)
-
-    async def _clear_pending_steer_reactions(self, session_key: str) -> None:
-        """Clear any remembered steer reactions for *session_key*."""
-        bucket = getattr(self, "_pending_steer_reactions", None)
-        if not isinstance(bucket, dict):
-            return
-        targets = bucket.pop(session_key, [])
-        if not targets or not self._reactions_enabled():
-            return
-        for chat_id, message_id in targets:
-            await self._clear_reaction(chat_id, message_id)
-
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
         if not self._reactions_enabled():
@@ -3453,42 +3209,18 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._set_reaction(chat_id, message_id, "\U0001f440")
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Clear processing reactions when a turn finishes.
+        """Swap the in-progress reaction for a final success/failure reaction.
 
-        Telegram reactions are a single-slot status indicator here, so we clear
-        the current message reaction, any queued follow-up reaction, and any
-        remembered steer reaction for the same session.
+        Unlike Discord (additive reactions), Telegram's set_message_reaction
+        replaces all existing reactions in one call — no remove step needed.
         """
         if not self._reactions_enabled():
             return
-
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
-        if chat_id and message_id:
-            await self._clear_reaction(chat_id, message_id)
-
-        # Telegram busy routing can leave a follow-up message buffered in the
-        # session's pending queue while the current turn is still finishing.
-        # When the turn completes, clear that follow-up reaction too so the
-        # original message and the steering/queue message disappear together.
-        try:
-            from gateway.session import build_session_key
-
-            session_key = build_session_key(
-                event.source,
-                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        if chat_id and message_id and outcome != ProcessingOutcome.CANCELLED:
+            await self._set_reaction(
+                chat_id,
+                message_id,
+                "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e",
             )
-            pending_event = getattr(self, "_pending_messages", {}).get(session_key)
-        except Exception:
-            pending_event = None
-            session_key = None
-
-        if pending_event:
-            pending_chat_id = getattr(getattr(pending_event, "source", None), "chat_id", None)
-            pending_message_id = getattr(pending_event, "message_id", None)
-            if pending_chat_id and pending_message_id and (pending_chat_id, pending_message_id) != (chat_id, message_id):
-                await self._clear_reaction(pending_chat_id, pending_message_id)
-
-        if session_key:
-            await self._clear_pending_steer_reactions(session_key)

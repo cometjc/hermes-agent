@@ -6,7 +6,9 @@ or corrupt user-visible content.
 """
 
 import re
+import subprocess
 import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -38,7 +40,7 @@ from gateway.platforms.telegram import (  # noqa: E402
     TelegramAdapter,
     _escape_mdv2,
     _strip_mdv2,
-    _wrap_markdown_tables,
+    _markdown_table_to_mermaid_svg_source,
 )
 
 
@@ -541,135 +543,82 @@ class TestStripMdv2:
 
 
 # =========================================================================
-# Markdown table auto-wrap
+# Markdown table → SVG attachment extraction
 # =========================================================================
 
 
-class TestWrapMarkdownTables:
-    """_wrap_markdown_tables wraps GFM pipe tables in ``` fences so
-    Telegram renders them as monospace preformatted text instead of the
-    noisy backslash-pipe mess MarkdownV2 produces."""
-
-    def test_basic_table_wrapped(self):
-        text = (
-            "Scores:\n\n"
-            "| Player | Score |\n"
-            "|--------|-------|\n"
-            "| Alice  | 150   |\n"
-            "| Bob    | 120   |\n"
-            "\nEnd."
+class TestMarkdownTableSvgExtraction:
+    def test_table_rendered_as_svg_attachment(self, adapter, monkeypatch):
+        monkeypatch.setattr(
+            "gateway.platforms.telegram.shutil.which",
+            lambda cmd: "/usr/bin/mmdc" if cmd == "mmdc" else None,
         )
-        out = _wrap_markdown_tables(text)
-        # Table is now wrapped in a fence
-        assert "```\n| Player | Score |" in out
-        assert "| Bob    | 120   |\n```" in out
-        # Surrounding prose is preserved
-        assert out.startswith("Scores:")
-        assert out.endswith("End.")
 
-    def test_bare_pipe_table_wrapped(self):
-        """Tables without outer pipes (GFM allows this) are still detected."""
-        text = "head1 | head2\n--- | ---\na | b\nc | d"
-        out = _wrap_markdown_tables(text)
-        assert out.startswith("```\n")
-        assert out.rstrip().endswith("```")
-        assert "head1 | head2" in out
+        def fake_run(args, capture_output, text, check):
+            assert args[0] == "/usr/bin/mmdc"
+            assert args[-2:] == ["-b", "transparent"]
+            mmd_path = Path(args[args.index("-i") + 1])
+            svg_path = Path(args[args.index("-o") + 1])
+            source = mmd_path.read_text(encoding="utf-8")
+            assert "flowchart TB" in source
+            assert "<table" in source
+            assert "<th style='padding: 4px 10px;" in source
+            svg_path.write_text("<svg xmlns='http://www.w3.org/2000/svg'></svg>", encoding="utf-8")
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
 
-    def test_alignment_separators(self):
-        """Separator rows with :--- / ---: / :---: alignment markers match."""
-        text = (
-            "| Name | Age | City |\n"
-            "|:-----|----:|:----:|\n"
-            "| Ada  |  30 | NYC  |"
-        )
-        out = _wrap_markdown_tables(text)
-        assert out.count("```") == 2
+        monkeypatch.setattr("gateway.platforms.telegram.subprocess.run", fake_run)
 
-    def test_two_consecutive_tables_wrapped_separately(self):
-        text = (
-            "| A | B |\n"
-            "|---|---|\n"
-            "| 1 | 2 |\n"
-            "\n"
-            "| X | Y |\n"
-            "|---|---|\n"
-            "| 9 | 8 |"
-        )
-        out = _wrap_markdown_tables(text)
-        # Four fences total — one opening + closing per table
-        assert out.count("```") == 4
-
-    def test_plain_text_with_pipes_not_wrapped(self):
-        """A bare pipe in prose must NOT trigger wrapping."""
-        text = "Use the | pipe operator to chain commands."
-        assert _wrap_markdown_tables(text) == text
-
-    def test_horizontal_rule_not_wrapped(self):
-        """A lone '---' horizontal rule must not be mistaken for a separator."""
-        text = "Section A\n\n---\n\nSection B"
-        assert _wrap_markdown_tables(text) == text
-
-    def test_existing_code_block_with_pipes_left_alone(self):
-        """A table already inside a fenced code block must not be re-wrapped."""
-        text = (
-            "```\n"
-            "| a | b |\n"
-            "|---|---|\n"
-            "| 1 | 2 |\n"
-            "```"
-        )
-        assert _wrap_markdown_tables(text) == text
-
-    def test_no_pipe_character_short_circuits(self):
-        text = "Plain **bold** text with no table."
-        assert _wrap_markdown_tables(text) == text
-
-    def test_no_dash_short_circuits(self):
-        text = "a | b\nc | d"  # has pipes but no '-' separator row
-        assert _wrap_markdown_tables(text) == text
-
-    def test_single_column_separator_not_matched(self):
-        """Single-column tables (rare) are not detected — we require at
-        least one internal pipe in the separator row to avoid false
-        positives on formatting rules."""
-        text = "| a |\n| - |\n| b |"
-        assert _wrap_markdown_tables(text) == text
-
-
-class TestFormatMessageTables:
-    """End-to-end: a pipe table passes through format_message with its
-    pipes and dashes left alone inside the fence, not mangled by MarkdownV2
-    escaping."""
-
-    def test_table_rendered_as_code_block(self, adapter):
         text = (
             "Data:\n\n"
             "| Col1 | Col2 |\n"
             "|------|------|\n"
             "| A    | B    |\n"
+            "\nEnd."
         )
-        out = adapter.format_message(text)
-        # Pipes inside the fenced block are NOT escaped
-        assert "```\n| Col1 | Col2 |" in out
-        assert "\\|" not in out.split("```")[1]
-        # Dashes in separator not escaped inside fence
-        assert "\\-" not in out.split("```")[1]
+        media, cleaned = adapter.extract_media(text)
 
-    def test_text_after_table_still_formatted(self, adapter):
-        text = (
-            "| A | B |\n"
-            "|---|---|\n"
-            "| 1 | 2 |\n"
-            "\n"
-            "Nice **work** team!"
+        assert len(media) == 1
+        svg_path, is_voice = media[0]
+        assert is_voice is False
+        assert svg_path.endswith(".svg")
+        assert Path(svg_path).exists()
+        assert "Col1" not in cleaned
+        assert "A" not in cleaned
+        assert "End." in cleaned
+
+    def test_table_inside_fenced_code_block_is_ignored(self, adapter, monkeypatch):
+        monkeypatch.setattr(
+            "gateway.platforms.telegram.shutil.which",
+            lambda cmd: "/usr/bin/mmdc" if cmd == "mmdc" else None,
         )
-        out = adapter.format_message(text)
-        # MarkdownV2 bold conversion still happens outside the table
-        assert "*work*" in out
-        # Exclamation outside fence is escaped
-        assert "\\!" in out
+        called = {"value": False}
 
-    def test_multiple_tables_in_single_message(self, adapter):
+        def fake_run(*args, **kwargs):
+            called["value"] = True
+            raise AssertionError("mmdc should not run for tables inside code fences")
+
+        monkeypatch.setattr("gateway.platforms.telegram.subprocess.run", fake_run)
+
+        text = "```\n| a | b |\n|---|---|\n| 1 | 2 |\n```"
+        media, cleaned = adapter.extract_media(text)
+
+        assert media == []
+        assert cleaned == text
+        assert called["value"] is False
+
+    def test_multiple_tables_in_single_message(self, adapter, monkeypatch):
+        monkeypatch.setattr(
+            "gateway.platforms.telegram.shutil.which",
+            lambda cmd: "/usr/bin/mmdc" if cmd == "mmdc" else None,
+        )
+
+        def fake_run(args, capture_output, text, check):
+            svg_path = Path(args[args.index("-o") + 1])
+            svg_path.write_text("<svg xmlns='http://www.w3.org/2000/svg'></svg>", encoding="utf-8")
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("gateway.platforms.telegram.subprocess.run", fake_run)
+
         text = (
             "First:\n"
             "| A | B |\n"
@@ -681,11 +630,59 @@ class TestFormatMessageTables:
             "|---|---|\n"
             "| 9 | 8 |\n"
         )
-        out = adapter.format_message(text)
-        # Two separate fenced blocks in the output
-        assert out.count("```") == 4
+        media, cleaned = adapter.extract_media(text)
 
-    def test_table_columns_are_padded(self, adapter):
+        assert len(media) == 2
+        assert cleaned.startswith("First:")
+        assert cleaned.endswith("\n") or cleaned.endswith("Second:")
+
+    def test_mermaid_source_contains_table_markup(self):
+        source = _markdown_table_to_mermaid_svg_source(
+            [
+                "| Name | Score |",
+                "|------|-------|",
+                "| Ada  | 100   |",
+            ]
+        )
+        assert "flowchart TB" in source
+        assert "<table" in source
+        assert "Ada" in source
+        assert "Score" in source
+
+class TestFormatMessageTables:
+    """A rendered SVG attachment means the message body no longer carries the
+    markdown table itself, so normal MarkdownV2 escaping can continue on the
+    remaining text."""
+
+    def test_text_after_table_still_formatted(self, adapter, monkeypatch):
+        monkeypatch.setattr(
+            "gateway.platforms.telegram.shutil.which",
+            lambda cmd: "/usr/bin/mmdc" if cmd == "mmdc" else None,
+        )
+
+        def fake_run(args, capture_output, text, check):
+            svg_path = Path(args[args.index("-o") + 1])
+            svg_path.write_text("<svg xmlns='http://www.w3.org/2000/svg'></svg>", encoding="utf-8")
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("gateway.platforms.telegram.subprocess.run", fake_run)
+
+        text = (
+            "| A | B |\n"
+            "|---|---|\n"
+            "| 1 | 2 |\n"
+            "\n"
+            "Nice **work** team!"
+        )
+        media, cleaned = adapter.extract_media(text)
+        assert len(media) == 1
+        out = adapter.format_message(cleaned)
+        # MarkdownV2 bold conversion still happens outside the table
+        assert "*work*" in out
+        # Exclamation outside the attachment is escaped
+        assert "\\!" in out
+
+    def test_table_columns_are_escaped_in_message_body(self, adapter):
         text = (
             "| Name | Score |\n"
             "|------|------:|\n"
@@ -693,12 +690,10 @@ class TestFormatMessageTables:
             "| Beatrice | 10 |\n"
         )
         out = adapter.format_message(text)
-        fenced = out.split("```")
-        assert len(fenced) >= 3
-        body = fenced[1].strip().splitlines()
-        assert body[0].startswith("| Name")
-        assert re.search(r"\| Name\s+\| Score \|", body[0])
-        assert re.search(r"\| Beatrice\s+\|\s+10 \|", body[3])
+        assert "```" not in out
+        assert "\\| Name \\| Score \\|" in out
+        assert "Beatrice" in out
+        assert "\\-" in out
 
 
 @pytest.mark.asyncio
