@@ -1654,6 +1654,9 @@ class GatewayRunner:
                     self.session_store.pop_pending_item(session_key, "steer")
                 except Exception:
                     pass
+                remember = getattr(adapter, "remember_pending_steer_reaction", None)
+                if callable(remember):
+                    remember(session_key, event)
                 if is_telegram:
                     await self._set_pending_indicator(adapter, event, "⚡")
                 return True
@@ -3396,6 +3399,10 @@ class GatewayRunner:
                     self.session_store.clear_pending_routing(_quick_key)
                 except Exception:
                     pass
+                if adapter:
+                    clear_steer_reactions = getattr(adapter, "clear_pending_steer_reactions", None)
+                    if callable(clear_steer_reactions):
+                        clear_steer_reactions(_quick_key)
                 self._pending_messages.pop(_quick_key, None)
                 self._release_running_agent_state(_quick_key)
                 logger.info("STOP for session %s — agent interrupted, session lock released", _quick_key[:20])
@@ -3420,6 +3427,10 @@ class GatewayRunner:
                     self.session_store.clear_pending_routing(_quick_key)
                 except Exception:
                     pass
+                if adapter:
+                    clear_steer_reactions = getattr(adapter, "clear_pending_steer_reactions", None)
+                    if callable(clear_steer_reactions):
+                        clear_steer_reactions(_quick_key)
                 self._pending_messages.pop(_quick_key, None)
                 # Clean up the running agent entry so the reset handler
                 # doesn't think an agent is still active.

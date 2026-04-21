@@ -365,6 +365,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._model_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
+        # Pending steer reactions that should be cleared when the turn ends.
+        self._pending_steer_reactions: Dict[str, list[tuple[str, str]]] = {}
         # Clarify prompt state: clarify_id → pending request metadata
         self._clarify_pending: Dict[str, dict] = {}
         self._clarify_counter = itertools.count(1)
@@ -3407,18 +3409,39 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _clear_reaction(self, chat_id: str, message_id: str) -> bool:
         """Clear reactions from a Telegram message."""
-        if not self._bot:
-            return False
-        try:
-            await self._bot.set_message_reaction(
-                chat_id=int(chat_id),
-                message_id=int(message_id),
-                reaction=None,
-            )
-            return True
-        except Exception as e:
-            logger.debug("[%s] clear_message_reaction failed: %s", self.name, e)
-            return False
+        return await self._set_reaction(chat_id, message_id, None)
+
+    def remember_pending_steer_reaction(self, session_key: str, event: MessageEvent) -> None:
+        """Remember a Telegram steer reaction so it can be cleared at turn end."""
+        chat_id = getattr(event.source, "chat_id", None)
+        message_id = getattr(event, "message_id", None)
+        if not chat_id or not message_id:
+            return
+        bucket = getattr(self, "_pending_steer_reactions", None)
+        if bucket is None:
+            bucket = {}
+            self._pending_steer_reactions = bucket
+        targets = bucket.setdefault(session_key, [])
+        target = (str(chat_id), str(message_id))
+        if target not in targets:
+            targets.append(target)
+
+    def clear_pending_steer_reactions(self, session_key: str) -> None:
+        """Forget any steer reactions queued for this session."""
+        bucket = getattr(self, "_pending_steer_reactions", None)
+        if isinstance(bucket, dict):
+            bucket.pop(session_key, None)
+
+    async def _clear_pending_steer_reactions(self, session_key: str) -> None:
+        """Clear any remembered steer reactions for *session_key*."""
+        bucket = getattr(self, "_pending_steer_reactions", None)
+        if not isinstance(bucket, dict):
+            return
+        targets = bucket.pop(session_key, [])
+        if not targets or not self._reactions_enabled():
+            return
+        for chat_id, message_id in targets:
+            await self._clear_reaction(chat_id, message_id)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
@@ -3430,7 +3453,12 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._set_reaction(chat_id, message_id, "\U0001f440")
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Remove the in-progress reaction when processing completes."""
+        """Clear processing reactions when a turn finishes.
+
+        Telegram reactions are a single-slot status indicator here, so we clear
+        the current message reaction, any queued follow-up reaction, and any
+        remembered steer reaction for the same session.
+        """
         if not self._reactions_enabled():
             return
 
@@ -3454,11 +3482,13 @@ class TelegramAdapter(BasePlatformAdapter):
             pending_event = getattr(self, "_pending_messages", {}).get(session_key)
         except Exception:
             pending_event = None
+            session_key = None
 
-        if not pending_event:
-            return
+        if pending_event:
+            pending_chat_id = getattr(getattr(pending_event, "source", None), "chat_id", None)
+            pending_message_id = getattr(pending_event, "message_id", None)
+            if pending_chat_id and pending_message_id and (pending_chat_id, pending_message_id) != (chat_id, message_id):
+                await self._clear_reaction(pending_chat_id, pending_message_id)
 
-        pending_chat_id = getattr(getattr(pending_event, "source", None), "chat_id", None)
-        pending_message_id = getattr(pending_event, "message_id", None)
-        if pending_chat_id and pending_message_id and (pending_chat_id, pending_message_id) != (chat_id, message_id):
-            await self._clear_reaction(pending_chat_id, pending_message_id)
+        if session_key:
+            await self._clear_pending_steer_reactions(session_key)

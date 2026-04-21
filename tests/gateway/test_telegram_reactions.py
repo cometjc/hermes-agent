@@ -190,14 +190,18 @@ async def test_on_processing_complete_success_clears_reaction(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_on_processing_complete_clears_current_and_pending_reactions(monkeypatch):
-    """Completion should clear the current and queued/steering reactions together."""
+async def test_on_processing_complete_clears_current_pending_and_steer_reactions(monkeypatch):
+    """Completion should clear the current, pending, and remembered steer reactions."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
     event = _make_event(chat_id="123", message_id="456")
     pending_event = _make_event(chat_id="123", message_id="789")
+    session_key = build_session_key(event.source)
     adapter._pending_messages = {
-        build_session_key(event.source): pending_event,
+        session_key: pending_event,
+    }
+    adapter._pending_steer_reactions = {
+        session_key: [("123", "999")],
     }
 
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
@@ -205,6 +209,7 @@ async def test_on_processing_complete_clears_current_and_pending_reactions(monke
     assert adapter._bot.set_message_reaction.await_args_list == [
         call(chat_id=123, message_id=456, reaction=None),
         call(chat_id=123, message_id=789, reaction=None),
+        call(chat_id=123, message_id=999, reaction=None),
     ]
 
 
