@@ -583,17 +583,21 @@ def _build_child_agent(
     # total iterations across parent + subagents can exceed the parent's
     # max_iterations.  The user controls the per-subagent cap in config.yaml.
 
-    child_thinking_cb = None
+    child_reasoning_cb = None
     if child_progress_cb:
-        def _child_thinking(text: str) -> None:
+        def _child_reasoning(text: str) -> None:
             if not text:
                 return
             try:
+                # Relay real reasoning content through the existing
+                # subagent.thinking plumbing, but do not use the agent's
+                # synthetic thinking_callback (which emits "reasoning..."
+                # status text).
                 child_progress_cb("_thinking", text)
             except Exception as e:
-                logger.debug("Child thinking callback relay failed: %s", e)
+                logger.debug("Child reasoning callback relay failed: %s", e)
 
-        child_thinking_cb = _child_thinking
+        child_reasoning_cb = _child_reasoning
 
     # Resolve effective credentials: config override > parent inherit
     effective_model = model or parent_agent.model
@@ -635,6 +639,7 @@ def _build_child_agent(
         max_tokens=getattr(parent_agent, "max_tokens", None),
         reasoning_config=child_reasoning,
         prefill_messages=getattr(parent_agent, "prefill_messages", None),
+        reasoning_callback=child_reasoning_cb,
         enabled_toolsets=child_toolsets,
         quiet_mode=True,
         ephemeral_system_prompt=child_prompt,
@@ -643,7 +648,7 @@ def _build_child_agent(
         skip_context_files=True,
         skip_memory=True,
         clarify_callback=None,
-        thinking_callback=child_thinking_cb,
+        thinking_callback=None,
         session_db=getattr(parent_agent, '_session_db', None),
         parent_session_id=getattr(parent_agent, 'session_id', None),
         providers_allowed=parent_agent.providers_allowed,

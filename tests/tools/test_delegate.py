@@ -282,7 +282,7 @@ class TestDelegateTask(unittest.TestCase):
 
         self.assertIs(mock_child._print_fn, sink)
 
-    def test_child_uses_thinking_callback_when_progress_callback_available(self):
+    def test_child_uses_reasoning_callback_but_not_thinking_callback(self):
         parent = _make_mock_parent(depth=0)
         parent.tool_progress_callback = MagicMock()
 
@@ -301,9 +301,15 @@ class TestDelegateTask(unittest.TestCase):
                 task_count=1,
             )
 
-        self.assertTrue(callable(mock_child.thinking_callback))
-        mock_child.thinking_callback("deliberating...")
-        parent.tool_progress_callback.assert_not_called()
+        call_kwargs = MockAgent.call_args.kwargs
+        self.assertTrue(callable(call_kwargs["reasoning_callback"]))
+        self.assertIsNone(call_kwargs["thinking_callback"])
+
+        call_kwargs["reasoning_callback"]("actual reasoning text")
+        parent.tool_progress_callback.assert_called_once()
+        args = parent.tool_progress_callback.call_args.args
+        self.assertEqual(args[0], "subagent.thinking")
+        self.assertEqual(args[2], "actual reasoning text")
 
 
 class TestToolNamePreservation(unittest.TestCase):
