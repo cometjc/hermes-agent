@@ -124,12 +124,12 @@ def _strip_mdv2(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Markdown table → code block conversion
+# Markdown table → formatted code block conversion
 # ---------------------------------------------------------------------------
 # Telegram's MarkdownV2 has no table syntax — '|' is just an escaped literal,
 # so pipe tables render as noisy backslash-pipe text with no alignment.
-# Wrapping the table in a fenced code block makes Telegram render it as
-# monospace preformatted text with columns intact.
+# We detect GFM-style tables and re-render them as a fenced code block with
+# padded columns, which preserves readability in Telegram.
 
 # Matches a GFM table delimiter row: optional outer pipes, cells containing
 # only dashes (with optional leading/trailing colons for alignment) separated
@@ -140,20 +140,125 @@ _TABLE_SEPARATOR_RE = re.compile(
 )
 
 
-def _is_table_row(line: str) -> bool:
-    """Return True if *line* could plausibly be a table data row."""
+def _split_markdown_table_row(line: str) -> list[str] | None:
+    """Split a potential pipe-table row into stripped cells."""
     stripped = line.strip()
-    return bool(stripped) and '|' in stripped
+    if not stripped or '|' not in stripped:
+        return None
+
+    parts = stripped.split('|')
+    if stripped.startswith('|'):
+        parts = parts[1:]
+    if stripped.endswith('|'):
+        parts = parts[:-1]
+
+    cells = [part.strip() for part in parts]
+    if len(cells) < 2:
+        return None
+    return cells
+
+
+def _is_table_row(line: str, expected_columns: int | None = None) -> bool:
+    """Return True if *line* could plausibly be a table data row."""
+    cells = _split_markdown_table_row(line)
+    if not cells:
+        return False
+    if expected_columns is not None and len(cells) != expected_columns:
+        return False
+    return True
+
+
+def _display_width(text: str) -> int:
+    """Return the monospace display width of *text*.
+
+    East Asian full-width / wide characters count as 2 columns so Chinese
+    tables stay aligned when rendered in Telegram's code blocks.
+    """
+    import unicodedata
+
+    width = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in {"F", "W"} else 1
+    return width
+
+
+def _pad_display(text: str, width: int, *, align: str = "left") -> str:
+    """Pad *text* to a target display *width* using spaces."""
+    pad = max(width - _display_width(text), 0)
+    if align == "right":
+        return (" " * pad) + text
+    if align == "center":
+        left = pad // 2
+        right = pad - left
+        return (" " * left) + text + (" " * right)
+    return text + (" " * pad)
+
+
+def _separator_alignment(cell: str) -> str:
+    """Return the alignment hint encoded in a markdown separator cell."""
+    cell = cell.strip()
+    if cell.startswith(":") and cell.endswith(":"):
+        return "center"
+    if cell.startswith(":"):
+        return "left"
+    if cell.endswith(":"):
+        return "right"
+    return "left"
+
+
+def _format_table_block(table_lines: list[str]) -> list[str]:
+    """Format a table block into a visually aligned fenced code block."""
+    header_cells = _split_markdown_table_row(table_lines[0]) or []
+    separator_cells = _split_markdown_table_row(table_lines[1]) or []
+    if len(header_cells) < 2 or len(header_cells) != len(separator_cells):
+        return table_lines
+
+    body_rows: list[list[str]] = []
+    for line in table_lines[2:]:
+        cells = _split_markdown_table_row(line)
+        if not cells or len(cells) != len(header_cells):
+            return table_lines
+        body_rows.append(cells)
+
+    columns = list(zip(header_cells, *body_rows)) if body_rows else [(cell,) for cell in header_cells]
+    widths = [max(_display_width(str(cell)) for cell in column) for column in columns]
+    aligns = [_separator_alignment(cell) for cell in separator_cells]
+
+    def render_row(cells: list[str]) -> str:
+        padded = [
+            _pad_display(cell, width, align=align)
+            for cell, width, align in zip(cells, widths, aligns)
+        ]
+        return "| " + " | ".join(padded) + " |"
+
+    def render_separator() -> str:
+        parts = []
+        for width, align in zip(widths, aligns):
+            dash_count = max(width, 3)
+            if align == "center":
+                parts.append(":" + "-" * dash_count + ":")
+            elif align == "right":
+                parts.append("-" * dash_count + ":")
+            elif align == "left":
+                parts.append(":" + "-" * dash_count)
+            else:
+                parts.append("-" * dash_count)
+        return "|" + "|".join(parts) + "|"
+
+    formatted = [render_row(header_cells), render_separator()]
+    formatted.extend(render_row(row) for row in body_rows)
+    return ["```", *formatted, "```"]
 
 
 def _wrap_markdown_tables(text: str) -> str:
     """Wrap GFM-style pipe tables in ``` fences so Telegram renders them.
 
     Detected by a row containing '|' immediately followed by a delimiter
-    row matching :data:`_TABLE_SEPARATOR_RE`.  Subsequent pipe-containing
-    non-blank lines are consumed as the table body and included in the
-    wrapped block.  Tables inside existing fenced code blocks are left
-    alone.
+    row matching :data:`_TABLE_SEPARATOR_RE`.  Subsequent table rows must
+    have the same number of cells; otherwise the original text is left
+    untouched.  Tables inside existing fenced code blocks are left alone.
     """
     if '|' not in text or '-' not in text:
         return text
@@ -179,19 +284,26 @@ def _wrap_markdown_tables(text: str) -> str:
 
         # Look for a header row (contains '|') immediately followed by a
         # delimiter row.
+        header_cells = _split_markdown_table_row(line)
         if (
-            '|' in line
+            header_cells
             and i + 1 < len(lines)
             and _TABLE_SEPARATOR_RE.match(lines[i + 1])
         ):
+            separator_cells = _split_markdown_table_row(lines[i + 1])
+            if not separator_cells or len(separator_cells) != len(header_cells):
+                out.append(line)
+                i += 1
+                continue
+
             table_block = [line, lines[i + 1]]
             j = i + 2
-            while j < len(lines) and _is_table_row(lines[j]):
+            while j < len(lines) and _is_table_row(lines[j], expected_columns=len(header_cells)):
                 table_block.append(lines[j])
                 j += 1
-            out.append('```')
-            out.extend(table_block)
-            out.append('```')
+
+            formatted_block = _format_table_block(table_block)
+            out.extend(formatted_block)
             i = j
             continue
 

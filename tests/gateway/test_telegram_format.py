@@ -685,6 +685,21 @@ class TestFormatMessageTables:
         # Two separate fenced blocks in the output
         assert out.count("```") == 4
 
+    def test_table_columns_are_padded(self, adapter):
+        text = (
+            "| Name | Score |\n"
+            "|------|------:|\n"
+            "| Al   | 9     |\n"
+            "| Beatrice | 10 |\n"
+        )
+        out = adapter.format_message(text)
+        fenced = out.split("```")
+        assert len(fenced) >= 3
+        body = fenced[1].strip().splitlines()
+        assert body[0].startswith("| Name")
+        assert re.search(r"\| Name\s+\| Score \|", body[0])
+        assert re.search(r"\| Beatrice\s+\|\s+10 \|", body[3])
+
 
 @pytest.mark.asyncio
 async def test_send_escapes_chunk_indicator_for_markdownv2(adapter):
