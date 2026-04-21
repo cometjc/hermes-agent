@@ -1,9 +1,9 @@
-"""Tests for AIAgent.steer() — mid-run user message injection.
+"""Tests for AIAgent.steer() — mid-run same-turn user input injection.
 
-/steer lets the user add a note to the agent's next tool result without
-interrupting the current tool call. The agent sees the note inline with
-tool output on its next iteration, preserving message-role alternation
-and prompt-cache integrity.
+/steer lets the user add a note to the agent's active turn without
+interrupting the current tool call. The agent sees the note as pending
+user input on the next model-request boundary, preserving message-role
+alternation and turn-boundary semantics.
 """
 from __future__ import annotations
 
@@ -20,7 +20,9 @@ def _bare_agent() -> AIAgent:
     used elsewhere in the test suite.
     """
     agent = object.__new__(AIAgent)
+    agent._active_turn_token = "test-turn"
     agent._pending_steer = None
+    agent._pending_steer_turn_token = None
     agent._pending_steer_lock = threading.Lock()
     return agent
 
@@ -44,6 +46,12 @@ class TestSteerAcceptance:
     def test_rejects_none(self):
         agent = _bare_agent()
         assert agent.steer(None) is False  # type: ignore[arg-type]
+        assert agent._pending_steer is None
+
+    def test_rejects_without_active_turn(self):
+        agent = _bare_agent()
+        agent._active_turn_token = None
+        assert agent.steer("hello") is False
         assert agent._pending_steer is None
 
     def test_strips_surrounding_whitespace(self):
@@ -70,9 +78,19 @@ class TestSteerDrain:
         agent = _bare_agent()
         assert agent._drain_pending_steer() is None
 
+    def test_turn_end_cleanup_clears_pending_steer_and_binding(self):
+        agent = _bare_agent()
+        agent.steer("hello")
+        assert agent._pending_steer == "hello"
+        assert agent._pending_steer_turn_token == "test-turn"
+        agent._clear_pending_steer()
+        agent._active_turn_token = None
+        assert agent._pending_steer is None
+        assert agent._pending_steer_turn_token is None
+
 
 class TestSteerInjection:
-    def test_appends_to_last_tool_result(self):
+    def test_appends_as_user_message(self):
         agent = _bare_agent()
         agent.steer("please also check auth.log")
         messages = [
@@ -81,13 +99,12 @@ class TestSteerInjection:
             {"role": "tool", "content": "ls output A", "tool_call_id": "a"},
             {"role": "tool", "content": "ls output B", "tool_call_id": "b"},
         ]
-        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=2)
-        # The LAST tool result is modified; earlier ones are untouched.
+        appended = agent._append_pending_steer_as_user_message(messages)
+        assert appended is True
+        # Earlier messages are untouched; steer becomes a fresh user message.
         assert messages[2]["content"] == "ls output A"
-        assert "ls output B" in messages[3]["content"]
-        assert "User guidance:" in messages[3]["content"]
-        assert "please also check auth.log" in messages[3]["content"]
-        # And pending_steer is consumed.
+        assert messages[3]["content"] == "ls output B"
+        assert messages[-1] == {"role": "user", "content": "please also check auth.log"}
         assert agent._pending_steer is None
 
     def test_no_op_when_no_steer_pending(self):
@@ -96,65 +113,34 @@ class TestSteerInjection:
             {"role": "assistant", "tool_calls": [{"id": "a"}]},
             {"role": "tool", "content": "output", "tool_call_id": "a"},
         ]
-        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
-        assert messages[-1]["content"] == "output"  # unchanged
+        appended = agent._append_pending_steer_as_user_message(messages)
+        assert appended is False
+        assert messages[-1]["content"] == "output"
 
-    def test_no_op_when_num_tool_msgs_zero(self):
+    def test_appends_even_without_tool_messages(self):
         agent = _bare_agent()
         agent.steer("steer")
         messages = [{"role": "user", "content": "hi"}]
-        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=0)
-        # Steer should remain pending (nothing to drain into)
-        assert agent._pending_steer == "steer"
+        appended = agent._append_pending_steer_as_user_message(messages)
+        assert appended is True
+        assert messages[-1] == {"role": "user", "content": "steer"}
 
-    def test_marker_labels_text_as_user_guidance(self):
-        """The injection marker must label the appended text as user
-        guidance so the model attributes it to the user rather than
-        confusing it with tool output.  This is the cache-safe way to
-        signal provenance without violating message-role alternation.
-        """
+    def test_turn_end_cleanup_persists_pending_steer(self):
         agent = _bare_agent()
         agent.steer("stop after next step")
-        messages = [{"role": "tool", "content": "x", "tool_call_id": "1"}]
-        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
-        content = messages[-1]["content"]
-        assert "User guidance:" in content
-        assert "stop after next step" in content
+        messages = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "done"}]
+        # Simulate the turn-end cleanup path.
+        assert agent._append_pending_steer_as_user_message(messages) is True
+        assert messages[-1] == {"role": "user", "content": "stop after next step"}
+        assert agent._pending_steer is None
 
-    def test_multimodal_content_list_preserved(self):
-        """Anthropic-style list content should be preserved, with the steer
-        appended as a text block."""
+    def test_turn_end_cleanup_does_not_duplicate_if_already_drained(self):
         agent = _bare_agent()
-        agent.steer("extra note")
-        original_blocks = [{"type": "text", "text": "existing output"}]
-        messages = [
-            {"role": "tool", "content": list(original_blocks), "tool_call_id": "1"}
-        ]
-        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
-        new_content = messages[-1]["content"]
-        assert isinstance(new_content, list)
-        assert len(new_content) == 2
-        assert new_content[0] == {"type": "text", "text": "existing output"}
-        assert new_content[1]["type"] == "text"
-        assert "extra note" in new_content[1]["text"]
-
-    def test_restashed_when_no_tool_result_in_batch(self):
-        """If the 'batch' contains no tool-role messages (e.g. all skipped
-        after an interrupt), the steer should be put back into the pending
-        slot so the caller's fallback path can deliver it."""
-        agent = _bare_agent()
-        agent.steer("ping")
-        messages = [
-            {"role": "user", "content": "x"},
-            {"role": "assistant", "content": "y"},
-        ]
-        # Claim there were N tool msgs, but the tail has none — simulates
-        # the interrupt-cancelled case.
-        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=2)
-        # Messages untouched
-        assert messages[-1]["content"] == "y"
-        # And the steer is back in pending so the fallback can grab it
-        assert agent._pending_steer == "ping"
+        agent.steer("stop after next step")
+        messages = [{"role": "assistant", "content": "done"}]
+        assert agent._append_pending_steer_as_user_message(messages) is True
+        assert agent._append_pending_steer_as_user_message(messages) is False
+        assert messages[-1] == {"role": "user", "content": "stop after next step"}
 
 
 class TestSteerThreadSafety:
@@ -202,16 +188,16 @@ class TestSteerClearedOnInterrupt:
 
 class TestPreApiCallSteerDrain:
     """Test that steers arriving during an API call are drained before the
-    next API call — not deferred until the next tool batch.  This is the
+    next API call — not deferred until the next model-request boundary.  This is the
     fix for the scenario where /steer sent during model thinking only lands
     after the agent is completely done."""
 
-    def test_pre_api_drain_injects_into_last_tool_result(self):
+    def test_pre_api_drain_appends_user_message(self):
         """If a steer is pending when the main loop starts building
-        api_messages, it should be injected into the last tool result
-        in the messages list."""
+        api_messages, it should be appended as a fresh user message in the
+        messages list."""
         agent = _bare_agent()
-        # Simulate messages after a tool batch completed
+        # Simulate messages after a model-request boundary completed
         messages = [
             {"role": "user", "content": "do something"},
             {"role": "assistant", "content": "ok", "tool_calls": [
@@ -221,59 +207,38 @@ class TestPreApiCallSteerDrain:
         ]
         # Steer arrives during API call (set after tool execution)
         agent.steer("focus on error handling")
-        # Simulate what the pre-API-call drain does:
-        _pre_api_steer = agent._drain_pending_steer()
-        assert _pre_api_steer == "focus on error handling"
-        # Inject into last tool msg (mirrors the new code in run_conversation)
-        for _si in range(len(messages) - 1, -1, -1):
-            if messages[_si].get("role") == "tool":
-                messages[_si]["content"] += f"\n\nUser guidance: {_pre_api_steer}"
-                break
-        assert "User guidance:" in messages[-1]["content"]
-        assert "focus on error handling" in messages[-1]["content"]
+        appended = agent._append_pending_steer_as_user_message(messages)
+        assert appended is True
+        assert messages[-1] == {"role": "user", "content": "focus on error handling"}
         assert agent._pending_steer is None
 
-    def test_pre_api_drain_restashes_when_no_tool_message(self):
-        """If there are no tool results yet (first iteration), the steer
-        should be put back into _pending_steer for the post-tool drain."""
+    def test_pre_api_drain_appends_even_without_tool_message(self):
+        """If there are no tool results yet (first iteration), the steer is
+        still turned into a user message instead of being parked for a later
+        model-request boundary."""
         agent = _bare_agent()
         messages = [
             {"role": "user", "content": "hello"},
         ]
         agent.steer("early steer")
-        _pre_api_steer = agent._drain_pending_steer()
-        assert _pre_api_steer == "early steer"
-        # No tool message found — put it back
-        found = False
-        for _si in range(len(messages) - 1, -1, -1):
-            if messages[_si].get("role") == "tool":
-                found = True
-                break
-        assert not found
-        # Restash
-        agent._pending_steer = _pre_api_steer
-        assert agent._pending_steer == "early steer"
+        appended = agent._append_pending_steer_as_user_message(messages)
+        assert appended is True
+        assert messages[-1] == {"role": "user", "content": "early steer"}
+        assert agent._pending_steer is None
 
-    def test_pre_api_drain_finds_tool_msg_past_assistant(self):
-        """The pre-API drain should scan backwards past a non-tool message
-        (e.g., if an assistant message was somehow appended after tools)
-        and still find the tool result."""
+    def test_turn_end_cleanup_persists_steer_as_user_message(self):
+        """If the turn finishes before another model request happens, the
+        pending steer should still be persisted into the finished turn."""
         agent = _bare_agent()
         messages = [
             {"role": "user", "content": "do something"},
-            {"role": "assistant", "content": "let me check", "tool_calls": [
-                {"id": "tc1", "function": {"name": "web_search", "arguments": "{}"}}
-            ]},
-            {"role": "tool", "content": "search results", "tool_call_id": "tc1"},
+            {"role": "assistant", "content": "done"},
         ]
         agent.steer("change approach")
-        _pre_api_steer = agent._drain_pending_steer()
-        assert _pre_api_steer is not None
-        for _si in range(len(messages) - 1, -1, -1):
-            if messages[_si].get("role") == "tool":
-                messages[_si]["content"] += f"\n\nUser guidance: {_pre_api_steer}"
-                break
-        assert "change approach" in messages[2]["content"]
+        # Turn-end cleanup should make the steer visible in returned history.
+        assert agent._append_pending_steer_as_user_message(messages) is True
+        assert messages[-1] == {"role": "user", "content": "change approach"}
+        assert agent._pending_steer is None
 
 
 class TestSteerCommandRegistry:
