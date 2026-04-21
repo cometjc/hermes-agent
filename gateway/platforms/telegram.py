@@ -403,7 +403,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if not clean_choices:
                 return "Clarify is not available in this execution context."
 
-            clarify_id = f"cl:{next(self._clarify_counter)}"
+            clarify_id = f"cl-{next(self._clarify_counter)}"
             response_future: concurrent.futures.Future[str] = concurrent.futures.Future()
 
             send_future = asyncio.run_coroutine_threadsafe(

@@ -122,7 +122,7 @@ async def test_clarify_callback_query_resolves_pending_request():
     adapter = _make_adapter()
     future: concurrent.futures.Future[str] = concurrent.futures.Future()
     adapter._clarify_pending = {
-        "clarify-1": {
+        "cl-1": {
             "future": future,
             "user_id": "777",
             "chat_id": "12345",
@@ -133,7 +133,7 @@ async def test_clarify_callback_query_resolves_pending_request():
     }
 
     query = AsyncMock()
-    query.data = "clr:clarify-1:1"
+    query.data = "clr:cl-1:1"
     query.message = MagicMock()
     query.message.chat_id = 12345
     query.message.message_id = 42
@@ -150,6 +150,6 @@ async def test_clarify_callback_query_resolves_pending_request():
 
     assert future.done()
     assert future.result() == "B"
-    assert "clarify-1" not in adapter._clarify_pending
+    assert "cl-1" not in adapter._clarify_pending
     query.answer.assert_called_once()
     query.edit_message_reply_markup.assert_called_once_with(reply_markup=None)
