@@ -23,7 +23,143 @@ _skill_commands: Dict[str, Dict[str, Any]] = {}
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
+# Matches ${HERMES_SKILL_DIR} / ${HERMES_SESSION_ID} tokens in SKILL.md.
+# Tokens that don't resolve (e.g. ${HERMES_SESSION_ID} with no session) are
+# left as-is so the user can debug them.
+_SKILL_TEMPLATE_RE = re.compile(r"\$\{(HERMES_SKILL_DIR|HERMES_SESSION_ID)\}")
 
+# Matches inline shell snippets like:  !`date +%Y-%m-%d`
+# Non-greedy, single-line only — no newlines inside the backticks.
+_INLINE_SHELL_RE = re.compile(r"!`([^`\n]+)`")
+
+# Cap inline-shell output so a runaway command can't blow out the context.
+_INLINE_SHELL_MAX_OUTPUT = 4000
+
+
+def _coerce_skill_priority(frontmatter: Dict[str, Any]) -> int:
+    """Return the skill priority as an integer (higher = earlier).
+
+    Skills without an explicit priority default to 0. Invalid values are
+    treated as 0 so metadata mistakes don't break scanning.
+    """
+    priority = frontmatter.get("priority", 0)
+    try:
+        return int(priority)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _load_skills_config() -> dict:
+    """Load the ``skills`` section of config.yaml (best-effort)."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        skills_cfg = cfg.get("skills")
+        if isinstance(skills_cfg, dict):
+            return skills_cfg
+    except Exception:
+        logger.debug("Could not read skills config", exc_info=True)
+    return {}
+
+
+def _substitute_template_vars(
+    content: str,
+    skill_dir: Path | None,
+    session_id: str | None,
+) -> str:
+    """Replace ${HERMES_SKILL_DIR} / ${HERMES_SESSION_ID} in skill content.
+
+    Only substitutes tokens for which a concrete value is available —
+    unresolved tokens are left in place so the author can spot them.
+    """
+    if not content:
+        return content
+
+    skill_dir_str = str(skill_dir) if skill_dir else None
+
+    def _replace(match: re.Match) -> str:
+        token = match.group(1)
+        if token == "HERMES_SKILL_DIR" and skill_dir_str:
+            return skill_dir_str
+        if token == "HERMES_SESSION_ID" and session_id:
+            return str(session_id)
+        return match.group(0)
+
+    return _SKILL_TEMPLATE_RE.sub(_replace, content)
+
+
+def _run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
+    """Execute a single inline-shell snippet and return its stdout (trimmed).
+
+    Failures return a short ``[inline-shell error: ...]`` marker instead of
+    raising, so one bad snippet can't wreck the whole skill message.
+    """
+    try:
+        completed = subprocess.run(
+            ["bash", "-c", command],
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            timeout=max(1, int(timeout)),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return f"[inline-shell timeout after {timeout}s: {command}]"
+    except FileNotFoundError:
+        return f"[inline-shell error: bash not found]"
+    except Exception as exc:
+        return f"[inline-shell error: {exc}]"
+
+    output = (completed.stdout or "").rstrip("\n")
+    if not output and completed.stderr:
+        output = completed.stderr.rstrip("\n")
+    if len(output) > _INLINE_SHELL_MAX_OUTPUT:
+        output = output[:_INLINE_SHELL_MAX_OUTPUT] + "…[truncated]"
+    return output
+
+
+def _expand_inline_shell(
+    content: str,
+    skill_dir: Path | None,
+    timeout: int,
+) -> str:
+    """Replace every !`cmd` snippet in ``content`` with its stdout.
+
+    Runs each snippet with the skill directory as CWD so relative paths in
+    the snippet work the way the author expects.
+    """
+    if "!`" not in content:
+        return content
+
+    def _replace(match: re.Match) -> str:
+        cmd = match.group(1).strip()
+        if not cmd:
+            return ""
+        return _run_inline_shell(cmd, skill_dir, timeout)
+
+    return _INLINE_SHELL_RE.sub(_replace, content)
+
+
+def build_plan_path(
+    user_instruction: str = "",
+    *,
+    now: datetime | None = None,
+) -> Path:
+    """Return the default workspace-relative markdown path for a /plan invocation.
+
+    Relative paths are intentional: file tools are task/backend-aware and resolve
+    them against the active working directory for local, docker, ssh, modal,
+    daytona, and similar terminal backends. That keeps the plan with the active
+    workspace instead of the Hermes host's global home directory.
+    """
+    slug_source = (user_instruction or "").strip().splitlines()[0] if user_instruction else ""
+    slug = _PLAN_SLUG_RE.sub("-", slug_source.lower()).strip("-")
+    if slug:
+        slug = "-".join(part for part in slug.split("-")[:8] if part)[:48].strip("-")
+    slug = slug or "conversation-plan"
+    timestamp = (now or datetime.now()).strftime("%Y-%m-%d_%H%M%S")
+    return Path(".hermes") / "plans" / f"{timestamp}-{slug}.md"
 def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
     """Load a skill by name/path and return (loaded_payload, skill_dir, display_name)."""
     raw_identifier = (skill_identifier or "").strip()
@@ -256,6 +392,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                                 description = line[:80]
                                 break
                     seen_names.add(name)
+                    priority = _coerce_skill_priority(frontmatter)
                     # Normalize to hyphen-separated slug, stripping
                     # non-alnum chars (e.g. +, /) to avoid invalid
                     # Telegram command names downstream.
@@ -267,6 +404,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     _skill_commands[f"/{cmd_name}"] = {
                         "name": name,
                         "description": description or f"Invoke the {name} skill",
+                        "priority": priority,
                         "skill_md_path": str(skill_md),
                         "skill_dir": str(skill_md.parent),
                     }
