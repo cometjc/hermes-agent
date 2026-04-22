@@ -266,6 +266,21 @@ if not _configured_cwd or _configured_cwd in (".", "auto", "cwd"):
     _fallback = os.getenv("MESSAGING_CWD") or str(Path.home())
     os.environ["TERMINAL_CWD"] = _fallback
 
+
+def _prepend_path_dirs(*dirs: Path) -> None:
+    """Prepend existing directories to PATH, preserving existing entries."""
+    parts = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    for directory in reversed(dirs):
+        directory = directory.expanduser()
+        if directory.is_dir():
+            resolved = str(directory.resolve())
+            if resolved not in parts:
+                parts.insert(0, resolved)
+    os.environ["PATH"] = os.pathsep.join(parts)
+
+
+_prepend_path_dirs(Path.home() / ".bun" / "bin")
+
 from gateway.config import (
     Platform,
     GatewayConfig,
@@ -947,7 +962,7 @@ class GatewayRunner:
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
 
-    def _build_telegram_clarify_callback(self, source: SessionSource):
+    def _build_telegram_clarify_callback(self, source: SessionSource, event_message_id: Optional[str] = None):
         """Return a Telegram clarify callback for this source, if supported."""
         if source.platform != Platform.TELEGRAM:
             return None
@@ -960,6 +975,7 @@ class GatewayRunner:
                 chat_id=source.chat_id,
                 thread_id=source.thread_id,
                 user_id=source.user_id,
+                reply_to_message_id=event_message_id,
             )
         except Exception as exc:
             logger.debug("Failed to build Telegram clarify callback for %s: %s", source.description, exc)
@@ -6629,7 +6645,7 @@ class GatewayRunner:
                     session_id=task_id,
                     platform=platform_key,
                     user_id=source.user_id,
-                    clarify_callback=self._build_telegram_clarify_callback(source),
+                    clarify_callback=self._build_telegram_clarify_callback(source, event_message_id=event_message_id),
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
@@ -9766,7 +9782,7 @@ class GatewayRunner:
                     session_id=session_id,
                     platform=platform_key,
                     user_id=source.user_id,
-                    clarify_callback=self._build_telegram_clarify_callback(source),
+                    clarify_callback=self._build_telegram_clarify_callback(source, event_message_id=event_message_id),
                     gateway_session_key=session_key,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
@@ -9787,6 +9803,7 @@ class GatewayRunner:
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides")
+            agent.clarify_callback = self._build_telegram_clarify_callback(source, event_message_id=event_message_id)
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []

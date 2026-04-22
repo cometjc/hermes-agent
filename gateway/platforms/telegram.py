@@ -423,6 +423,7 @@ class TelegramAdapter(BasePlatformAdapter):
         *,
         chat_id: str,
         thread_id: Optional[str],
+        reply_to_message_id: Optional[str],
         question: str,
         choices: list[str],
     ) -> Optional[str]:
@@ -443,6 +444,8 @@ class TelegramAdapter(BasePlatformAdapter):
         message_thread_id = self._message_thread_id_for_send(thread_id)
         if message_thread_id is not None:
             kwargs["message_thread_id"] = message_thread_id
+        if reply_to_message_id not in (None, ""):
+            kwargs["reply_to_message_id"] = int(reply_to_message_id)
         keyboard = self._build_clarify_reply_keyboard(choices)
         if keyboard is not None:
             kwargs["reply_markup"] = keyboard
@@ -455,6 +458,7 @@ class TelegramAdapter(BasePlatformAdapter):
         *,
         chat_id: str,
         thread_id: Optional[str],
+        reply_to_message_id: Optional[str],
         text: str,
     ) -> None:
         """Send a small cleanup message that removes the reply keyboard."""
@@ -470,6 +474,8 @@ class TelegramAdapter(BasePlatformAdapter):
         message_thread_id = self._message_thread_id_for_send(thread_id)
         if message_thread_id is not None:
             kwargs["message_thread_id"] = message_thread_id
+        if reply_to_message_id not in (None, ""):
+            kwargs["reply_to_message_id"] = int(reply_to_message_id)
         try:
             await self._bot.send_message(**kwargs)
         except Exception:
@@ -491,6 +497,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if not state:
             return False
 
+        reply_to_message_id = state.get("reply_to_message_id")
         caller_id = str(getattr(getattr(message, "from_user", None), "id", ""))
         expected_user_id = state.get("user_id")
         if expected_user_id and caller_id != expected_user_id:
@@ -517,11 +524,12 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._clear_clarify_keyboard(
             chat_id=chat_id,
             thread_id=str(thread_id) if thread_id is not None else None,
+            reply_to_message_id=reply_to_message_id,
             text=f"✅ 收到：{response}",
         )
         return True
 
-    def build_clarify_callback(self, *, chat_id, thread_id, user_id):
+    def build_clarify_callback(self, *, chat_id, thread_id, user_id, reply_to_message_id=None):
         """Build a sync clarify callback backed by Telegram reply keyboards."""
         pending_key = self._clarify_pending_key(str(chat_id), thread_id)
 
@@ -549,12 +557,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 "response_queue": response_queue,
                 "user_id": str(user_id) if user_id is not None else "",
                 "thread_id": str(thread_id) if thread_id is not None else None,
+                "reply_to_message_id": str(reply_to_message_id) if reply_to_message_id not in (None, "") else None,
             }
 
             send_future = asyncio.run_coroutine_threadsafe(
                 self._send_clarify_prompt(
                     chat_id=str(chat_id),
                     thread_id=str(thread_id) if thread_id is not None else None,
+                    reply_to_message_id=str(reply_to_message_id) if reply_to_message_id not in (None, "") else None,
                     question=str(question).strip() if question else "",
                     choices=normalized_choices,
                 ),
@@ -574,6 +584,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     self._clear_clarify_keyboard(
                         chat_id=str(chat_id),
                         thread_id=str(thread_id) if thread_id is not None else None,
+                        reply_to_message_id=str(reply_to_message_id) if reply_to_message_id not in (None, "") else None,
                         text="⏱️ Clarify timed out — the agent will decide.",
                     ),
                     loop,

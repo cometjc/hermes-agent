@@ -87,6 +87,7 @@ async def test_build_clarify_callback_uses_reply_keyboard_and_resolves_text_repl
         chat_id="12345",
         thread_id="99",
         user_id="777",
+        reply_to_message_id="456",
     )
 
     task = asyncio.create_task(asyncio.to_thread(callback, "Pick one?", ["Alpha", "Beta"]))
@@ -96,6 +97,7 @@ async def test_build_clarify_callback_uses_reply_keyboard_and_resolves_text_repl
     prompt_kwargs = adapter._bot.send_message.await_args.kwargs
     assert prompt_kwargs["chat_id"] == 12345
     assert prompt_kwargs["message_thread_id"] == 99
+    assert prompt_kwargs["reply_to_message_id"] == 456
     assert isinstance(prompt_kwargs["reply_markup"], _ReplyKeyboardMarkup)
     assert [row[0].text for row in prompt_kwargs["reply_markup"].keyboard] == ["Alpha", "Beta"]
 
@@ -114,6 +116,7 @@ async def test_build_clarify_callback_uses_reply_keyboard_and_resolves_text_repl
     cleanup_kwargs = adapter._bot.send_message.await_args_list[1].kwargs
     assert cleanup_kwargs["chat_id"] == 12345
     assert cleanup_kwargs["message_thread_id"] == 99
+    assert cleanup_kwargs["reply_to_message_id"] == 456
     assert isinstance(cleanup_kwargs["reply_markup"], _ReplyKeyboardRemove)
     assert "收到" in cleanup_kwargs["text"]
 
@@ -131,6 +134,7 @@ async def test_build_clarify_callback_times_out_and_clears_keyboard():
         chat_id="12345",
         thread_id="99",
         user_id="777",
+        reply_to_message_id="456",
     )
 
     result = await asyncio.to_thread(callback, "Pick one?", ["Alpha", "Beta"])
