@@ -1075,8 +1075,8 @@ When enabled, responses appear token-by-token inside a streaming box. Tool calls
 ```yaml
 streaming:
   enabled: true           # Enable progressive message editing
-  transport: native       # "native" = Telegram draft API (Telegram only; others fall back to edit)
-  # transport: edit       # "edit" (progressive message editing) or "off"
+  transport: native       # default for Telegram; use "edit" to force progressive message edits
+  # transport: edit       # force progressive message editing (legacy fallback) or "off"
   edit_interval: 0.3      # Seconds between message edits
   buffer_threshold: 40    # Characters before forcing an edit flush
   cursor: " ▉"            # Cursor shown during streaming

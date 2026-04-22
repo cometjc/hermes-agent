@@ -44,7 +44,7 @@ class StreamConsumerConfig:
     buffer_threshold: int = 40
     cursor: str = " ▉"
     buffer_only: bool = False
-    transport: str = "edit"
+    transport: str = "native"
 
 
 class GatewayStreamConsumer:

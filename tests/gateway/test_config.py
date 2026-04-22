@@ -9,6 +9,7 @@ from gateway.config import (
     Platform,
     PlatformConfig,
     SessionResetPolicy,
+    StreamingConfig,
     _apply_env_overrides,
     load_gateway_config,
 )
@@ -139,6 +140,17 @@ class TestSessionResetPolicy:
         assert restored.mode == "both"
         assert restored.at_hour == 4
         assert restored.idle_minutes == 1440
+
+
+class TestStreamingConfigDefaults:
+    def test_default_transport_is_native(self):
+        cfg = StreamingConfig()
+        assert cfg.transport == "native"
+
+    def test_from_dict_defaults_transport_to_native(self):
+        cfg = StreamingConfig.from_dict({"enabled": True})
+        assert cfg.enabled is True
+        assert cfg.transport == "native"
 
 
 class TestGatewayConfigRoundtrip:

@@ -457,7 +457,7 @@ group_sessions_per_user: true
 # Disabled by default — enable to try the streaming UX on Telegram/Discord/Slack.
 streaming:
   enabled: false
-  # transport: native         # "native" = Telegram draft API (Telegram only; others fall back to edit)
+  transport: native          # default for Telegram; use "edit" to force progressive message edits
   # edit_interval: 0.3        # seconds between message edits
   # buffer_threshold: 40      # chars before forcing an edit flush
   # cursor: " ▉"              # cursor shown during streaming
