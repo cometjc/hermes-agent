@@ -1333,23 +1333,28 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         
         try:
-            # Format and split message if needed
+            # Extract media attachments first so Markdown tables can be rendered
+            # as SVG files, then format the remaining text for Telegram.
+            media_files, content = self.extract_media(content)
             formatted = self.format_message(content)
-            chunks = self.truncate_message(
-                formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
-            )
-            if len(chunks) > 1:
-                # truncate_message appends a raw " (1/2)" suffix. Escape the
-                # MarkdownV2-special parentheses so Telegram doesn't reject the
-                # chunk and fall back to plain text.
-                chunks = [
-                    re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
-                    for chunk in chunks
-                ]
-            
+            if not formatted or not formatted.strip():
+                chunks = []
+            else:
+                chunks = self.truncate_message(
+                    formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+                )
+                if len(chunks) > 1:
+                    # truncate_message appends a raw " (1/2)" suffix. Escape the
+                    # MarkdownV2-special parentheses so Telegram doesn't reject the
+                    # chunk and fall back to plain text.
+                    chunks = [
+                        re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
+                        for chunk in chunks
+                    ]
+
             message_ids = []
             thread_id = self._metadata_thread_id(metadata)
-            
+
             try:
                 from telegram.error import NetworkError as _NetErr
             except ImportError:
@@ -1456,13 +1461,35 @@ class TelegramAdapter(BasePlatformAdapter):
                                 continue
                         raise
                 message_ids.append(str(msg.message_id))
-            
+
+            for media_path, is_voice in media_files:
+                try:
+                    ext = os.path.splitext(media_path)[1].lower()
+                    if ext in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+                        media_result = await self.send_image_file(
+                            chat_id=chat_id,
+                            image_path=media_path,
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                    else:
+                        media_result = await self.send_document(
+                            chat_id=chat_id,
+                            file_path=media_path,
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                    if media_result.success and media_result.message_id:
+                        message_ids.append(str(media_result.message_id))
+                except Exception as media_err:
+                    logger.warning("[%s] Failed to send extracted media from response: %s", self.name, media_err)
+
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
                 raw_response={"message_ids": message_ids}
             )
-            
+
         except Exception as e:
             logger.error("[%s] Failed to send Telegram message: %s", self.name, e, exc_info=True)
             # TimedOut means the request may have reached Telegram —

@@ -654,6 +654,49 @@ class TestFormatMessageTables:
     markdown table itself, so normal MarkdownV2 escaping can continue on the
     remaining text."""
 
+    @pytest.mark.asyncio
+    async def test_send_renders_markdown_table_as_svg_attachment(self, adapter, monkeypatch):
+        monkeypatch.setattr(
+            "gateway.platforms.telegram.shutil.which",
+            lambda cmd: "/usr/bin/mmdc" if cmd == "mmdc" else None,
+        )
+
+        def fake_run(args, capture_output, text, check):
+            svg_path = Path(args[args.index("-o") + 1])
+            svg_path.write_text("<svg xmlns='http://www.w3.org/2000/svg'></svg>", encoding="utf-8")
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("gateway.platforms.telegram.subprocess.run", fake_run)
+
+        sent_texts = []
+        sent_documents = []
+
+        async def fake_send_message(**kwargs):
+            sent_texts.append(kwargs["text"])
+            msg = MagicMock()
+            msg.message_id = 123
+            return msg
+
+        async def fake_send_document(**kwargs):
+            sent_documents.append(kwargs)
+            msg = MagicMock()
+            msg.message_id = 456
+            return msg
+
+        adapter._bot = MagicMock()
+        adapter._bot.send_message = AsyncMock(side_effect=fake_send_message)
+        adapter._bot.send_document = AsyncMock(side_effect=fake_send_document)
+
+        result = await adapter.send(
+            "123",
+            "| A | B |\n|---|---|\n| 1 | 2 |",
+        )
+
+        assert result.success is True
+        assert sent_documents, "expected markdown table to be converted into an SVG attachment"
+        assert sent_texts == []
+        assert sent_documents[0]["filename"].endswith(".svg")
+
     def test_text_after_table_still_formatted(self, adapter, monkeypatch):
         monkeypatch.setattr(
             "gateway.platforms.telegram.shutil.which",
