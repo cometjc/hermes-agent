@@ -50,6 +50,10 @@ _fake_telegram.Bot = object
 _fake_telegram.Message = object
 _fake_telegram.InlineKeyboardButton = object
 _fake_telegram.InlineKeyboardMarkup = object
+_fake_telegram.ReplyKeyboardMarkup = object
+_fake_telegram.ReplyKeyboardRemove = object
+_fake_telegram.KeyboardButton = object
+_fake_telegram.LinkPreviewOptions = object
 _fake_telegram_error = types.ModuleType("telegram.error")
 _fake_telegram_error.NetworkError = FakeNetworkError
 _fake_telegram_error.BadRequest = FakeBadRequest
@@ -82,6 +86,8 @@ def _inject_fake_telegram(monkeypatch):
     monkeypatch.setitem(sys.modules, "telegram.constants", _fake_telegram_constants)
     monkeypatch.setitem(sys.modules, "telegram.ext", _fake_telegram_ext)
     monkeypatch.setitem(sys.modules, "telegram.request", _fake_telegram_request)
+    sys.modules.pop("gateway.platforms.telegram", None)
+    sys.modules.pop("gateway.platforms", None)
 
 
 def _make_adapter():
