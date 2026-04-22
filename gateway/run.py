@@ -965,6 +965,7 @@ class GatewayRunner:
             logger.debug("Failed to build Telegram clarify callback for %s: %s", source.description, exc)
             return None
 
+
     def _resolve_session_agent_runtime(
         self,
         *,
