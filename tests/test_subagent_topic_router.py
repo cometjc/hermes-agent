@@ -353,6 +353,30 @@ class TestFormatEvent:
         assert out.startswith("· ")
 
 
+class TestRenderProgressMessage:
+    def test_goal_only_on_start(self, router: SubagentTopicRouter):
+        entry = {"topic_name": "SA Analyze", "goal": "Analyze the 48 local commits and propose conservative topic groupings before sync"}
+
+        first = router._render_progress_message(
+            session_id="sess1234",
+            entry=entry,
+            event_text="🔀 Started: Analyze the 48 local commits",
+            include_goal=True,
+        )
+        assert "Goal:" in first
+        assert "Analyze the 48 local commits" in first
+
+        later = router._render_progress_message(
+            session_id="sess1234",
+            entry=entry,
+            event_text="💭 Using search_files for package files could work",
+            include_goal=False,
+        )
+        assert "Goal:" not in later
+        assert later.startswith("🔀 SA Analyze")
+        assert "💭 Using search_files" in later
+
+
 # ---------------------------------------------------------------------------
 # B. State I/O
 # ---------------------------------------------------------------------------

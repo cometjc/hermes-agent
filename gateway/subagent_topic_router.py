@@ -272,6 +272,7 @@ class SubagentTopicRouter:
                 session_id=session_id,
                 entry=entry,
                 event_text=msg,
+                event_type=event_type,
                 adapter=adapter,
             ):
                 return
@@ -641,12 +642,15 @@ class SubagentTopicRouter:
         session_id: str,
         entry: Dict[str, Any],
         event_text: str,
+        include_goal: bool = False,
     ) -> str:
         """Render the single edited progress message for a subagent session."""
         topic_name = str(entry.get("topic_name") or f"Session {session_id[:8]}").strip()
         goal = str(entry.get("goal") or "").strip()
-        if goal:
+        if include_goal and goal:
             goal = _summarize(goal, max_chars=180)
+        else:
+            goal = ""
         lines = [f"🔀 {topic_name}"]
         if goal:
             lines.append(f"Goal: {goal}")
@@ -659,6 +663,7 @@ class SubagentTopicRouter:
         session_id: str,
         entry: Dict[str, Any],
         event_text: str,
+        event_type: str,
         adapter: "BasePlatformAdapter",
     ) -> bool:
         """Edit or send the single subagent progress message in place."""
@@ -666,6 +671,7 @@ class SubagentTopicRouter:
             session_id=session_id,
             entry=entry,
             event_text=event_text,
+            include_goal=(event_type == "subagent.start"),
         )
         chat_id = str(entry.get("chat_id") or "")
         thread_id = entry.get("thread_id")
