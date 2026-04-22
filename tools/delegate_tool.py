@@ -195,6 +195,12 @@ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during de
 _HEARTBEAT_STALE_CYCLES = 5  # mark child stale after this many heartbeats with no iteration progress
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 
+# Reasoning deltas can arrive token-by-token from streaming providers.
+# Buffer tiny chunks so Telegram / CLI do not spam one update per word.
+_REASONING_IMMEDIATE_MIN_CHARS = 20
+_REASONING_FLUSH_CHARS = 120
+_REASONING_END_PUNCT = (".", "!", "?", "。", "！", "？")
+
 
 # ---------------------------------------------------------------------------
 # Delegation progress event types
@@ -368,6 +374,7 @@ def _build_child_progress_callback(task_index: int, goal: str, parent_agent, tas
     # Gateway: batch tool names, flush periodically
     _BATCH_SIZE = 5
     _batch: List[str] = []
+    _reasoning_batch: List[str] = []
 
     def _relay(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
         if not parent_cb:
@@ -386,9 +393,40 @@ def _build_child_progress_callback(task_index: int, goal: str, parent_agent, tas
         except Exception as e:
             logger.debug("Parent callback failed: %s", e)
 
+    def _emit_reasoning(text: str) -> None:
+        if not text:
+            return
+        if spinner:
+            short = (text[:55] + "...") if len(text) > 55 else text
+            try:
+                spinner.print_above(f" {prefix}├─ 💭 {short}")
+            except Exception as e:
+                logger.debug("Spinner print_above failed: %s", e)
+        _relay("subagent.thinking", preview=text)
+
+    def _flush_reasoning(*, force: bool = False) -> None:
+        if not _reasoning_batch:
+            return
+
+        text = "".join(_reasoning_batch).strip()
+        if not text:
+            _reasoning_batch.clear()
+            return
+
+        if not force:
+            trimmed = text.rstrip()
+            if len(trimmed) < _REASONING_FLUSH_CHARS and not trimmed.endswith(_REASONING_END_PUNCT):
+                return
+
+        _reasoning_batch.clear()
+        _emit_reasoning(text)
+
     def _callback(event_type, tool_name: str = None, preview: str = None, args=None, **kwargs):
         # Lifecycle events emitted by the orchestrator itself — handled
         # before enum normalisation since they are not part of DelegateEvent.
+        if event_type not in ("_thinking", "reasoning.available"):
+            _flush_reasoning(force=True)
+
         if event_type == "subagent.start":
             if spinner and goal_label:
                 short = (goal_label[:55] + "...") if len(goal_label) > 55 else goal_label
@@ -419,13 +457,22 @@ def _build_child_progress_callback(task_index: int, goal: str, parent_agent, tas
 
         if event == DelegateEvent.TASK_THINKING:
             text = preview or tool_name or ""
-            if spinner:
-                short = (text[:55] + "...") if len(text) > 55 else text
-                try:
-                    spinner.print_above(f" {prefix}├─ 💭 \"{short}\"")
-                except Exception as e:
-                    logger.debug("Spinner print_above failed: %s", e)
-            _relay("subagent.thinking", preview=text)
+            normalized = text.strip()
+            if not normalized:
+                return
+
+            # CLI / non-gateway paths keep the old immediate spinner behaviour.
+            # We only buffer when there is a parent callback to protect the
+            # Telegram progress topic from token-level spam.
+            if parent_cb is None:
+                _emit_reasoning(normalized)
+                return
+
+            if not _reasoning_batch and len(normalized) > _REASONING_IMMEDIATE_MIN_CHARS:
+                _emit_reasoning(normalized)
+                return
+            _reasoning_batch.append(text)
+            _flush_reasoning(force=False)
             return
 
         if event == DelegateEvent.TASK_TOOL_COMPLETED:
@@ -475,6 +522,7 @@ def _build_child_progress_callback(task_index: int, goal: str, parent_agent, tas
 
     def _flush():
         """Flush remaining batched tool names to gateway on completion."""
+        _flush_reasoning(force=True)
         if parent_cb and _batch:
             summary = ", ".join(_batch)
             _relay("subagent.progress", preview=f"🔀 {prefix}{summary}")
