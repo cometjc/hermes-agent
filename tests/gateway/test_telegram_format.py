@@ -547,8 +547,8 @@ class TestStripMdv2:
 # =========================================================================
 
 
-class TestMarkdownTableSvgExtraction:
-    def test_table_rendered_as_svg_attachment(self, adapter, monkeypatch):
+class TestMarkdownTablePngExtraction:
+    def test_table_rendered_as_png_attachment(self, adapter, monkeypatch):
         monkeypatch.setattr(
             "gateway.platforms.telegram.shutil.which",
             lambda cmd: "/usr/bin/mmdc" if cmd == "mmdc" else None,
@@ -556,14 +556,14 @@ class TestMarkdownTableSvgExtraction:
 
         def fake_run(args, capture_output, text, check):
             assert args[0] == "/usr/bin/mmdc"
-            assert args[-2:] == ["-b", "transparent"]
+            assert args[-2:] == ["-e", "png"]
             mmd_path = Path(args[args.index("-i") + 1])
-            svg_path = Path(args[args.index("-o") + 1])
+            png_path = Path(args[args.index("-o") + 1])
             source = mmd_path.read_text(encoding="utf-8")
             assert "flowchart TB" in source
             assert "<table" in source
             assert "<th style='padding: 4px 10px;" in source
-            svg_path.write_text("<svg xmlns='http://www.w3.org/2000/svg'></svg>", encoding="utf-8")
+            png_path.write_bytes(b"PNG")
             return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr("gateway.platforms.telegram.subprocess.run", fake_run)
@@ -578,10 +578,10 @@ class TestMarkdownTableSvgExtraction:
         media, cleaned = adapter.extract_media(text)
 
         assert len(media) == 1
-        svg_path, is_voice = media[0]
+        png_path, is_voice = media[0]
         assert is_voice is False
-        assert svg_path.endswith(".svg")
-        assert Path(svg_path).exists()
+        assert png_path.endswith(".png")
+        assert Path(png_path).exists()
         assert "Col1" not in cleaned
         assert "A" not in cleaned
         assert "End." in cleaned
@@ -613,8 +613,8 @@ class TestMarkdownTableSvgExtraction:
         )
 
         def fake_run(args, capture_output, text, check):
-            svg_path = Path(args[args.index("-o") + 1])
-            svg_path.write_text("<svg xmlns='http://www.w3.org/2000/svg'></svg>", encoding="utf-8")
+            png_path = Path(args[args.index("-o") + 1])
+            png_path.write_bytes(b"PNG")
             return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr("gateway.platforms.telegram.subprocess.run", fake_run)
@@ -650,26 +650,26 @@ class TestMarkdownTableSvgExtraction:
         assert "Score" in source
 
 class TestFormatMessageTables:
-    """A rendered SVG attachment means the message body no longer carries the
+    """A rendered PNG attachment means the message body no longer carries the
     markdown table itself, so normal MarkdownV2 escaping can continue on the
     remaining text."""
 
     @pytest.mark.asyncio
-    async def test_send_renders_markdown_table_as_svg_attachment(self, adapter, monkeypatch):
+    async def test_send_renders_markdown_table_as_png_attachment(self, adapter, monkeypatch):
         monkeypatch.setattr(
             "gateway.platforms.telegram.shutil.which",
             lambda cmd: "/usr/bin/mmdc" if cmd == "mmdc" else None,
         )
 
         def fake_run(args, capture_output, text, check):
-            svg_path = Path(args[args.index("-o") + 1])
-            svg_path.write_text("<svg xmlns='http://www.w3.org/2000/svg'></svg>", encoding="utf-8")
+            png_path = Path(args[args.index("-o") + 1])
+            png_path.write_bytes(b"PNG")
             return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr("gateway.platforms.telegram.subprocess.run", fake_run)
 
         sent_texts = []
-        sent_documents = []
+        sent_photos = []
 
         async def fake_send_message(**kwargs):
             sent_texts.append(kwargs["text"])
@@ -677,15 +677,15 @@ class TestFormatMessageTables:
             msg.message_id = 123
             return msg
 
-        async def fake_send_document(**kwargs):
-            sent_documents.append(kwargs)
+        async def fake_send_photo(**kwargs):
+            sent_photos.append(kwargs)
             msg = MagicMock()
             msg.message_id = 456
             return msg
 
         adapter._bot = MagicMock()
         adapter._bot.send_message = AsyncMock(side_effect=fake_send_message)
-        adapter._bot.send_document = AsyncMock(side_effect=fake_send_document)
+        adapter._bot.send_photo = AsyncMock(side_effect=fake_send_photo)
 
         result = await adapter.send(
             "123",
@@ -693,9 +693,9 @@ class TestFormatMessageTables:
         )
 
         assert result.success is True
-        assert sent_documents, "expected markdown table to be converted into an SVG attachment"
+        assert sent_photos, "expected markdown table to be converted into a PNG photo"
         assert sent_texts == []
-        assert sent_documents[0]["filename"].endswith(".svg")
+        assert sent_photos[0]["photo"].name.endswith(".png")
 
     def test_text_after_table_still_formatted(self, adapter, monkeypatch):
         monkeypatch.setattr(

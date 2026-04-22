@@ -230,37 +230,37 @@ def _markdown_table_to_mermaid_svg_source(table_lines: list[str]) -> str:
     )
 
 
-def _render_markdown_table_svg(table_lines: list[str]) -> Optional[str]:
-    """Render a Markdown pipe table to a temporary SVG via Mermaid CLI."""
+def _render_markdown_table_png(table_lines: list[str]) -> Optional[str]:
+    """Render a Markdown pipe table to a temporary PNG via Mermaid CLI."""
     mmdc = shutil.which('mmdc')
     if not mmdc:
-        logger.warning("[Telegram] mmdc not found; cannot render Markdown table as SVG")
+        logger.warning("[Telegram] mmdc not found; cannot render Markdown table as PNG")
         return None
 
     mermaid_source = _markdown_table_to_mermaid_svg_source(table_lines)
     mmd_fd, mmd_path = tempfile.mkstemp(prefix='hermes-table-', suffix='.mmd')
-    svg_fd, svg_path = tempfile.mkstemp(prefix='hermes-table-', suffix='.svg')
+    png_fd, png_path = tempfile.mkstemp(prefix='hermes-table-', suffix='.png')
     os.close(mmd_fd)
-    os.close(svg_fd)
+    os.close(png_fd)
     try:
         with open(mmd_path, 'w', encoding='utf-8') as fh:
             fh.write(mermaid_source)
         result = subprocess.run(
-            [mmdc, '-i', mmd_path, '-o', svg_path, '-b', 'transparent'],
+            [mmdc, '-i', mmd_path, '-o', png_path, '-b', 'transparent', '-e', 'png'],
             capture_output=True,
             text=True,
             check=False,
         )
         if result.returncode != 0:
             logger.warning(
-                "[Telegram] mmdc failed rendering Markdown table to SVG: %s",
+                "[Telegram] mmdc failed rendering Markdown table to PNG: %s",
                 (result.stderr or result.stdout or '').strip(),
             )
             return None
-        if not os.path.exists(svg_path) or os.path.getsize(svg_path) == 0:
-            logger.warning("[Telegram] mmdc finished but produced no SVG output")
+        if not os.path.exists(png_path) or os.path.getsize(png_path) == 0:
+            logger.warning("[Telegram] mmdc finished but produced no PNG output")
             return None
-        return svg_path
+        return png_path
     finally:
         try:
             os.remove(mmd_path)
@@ -269,13 +269,13 @@ def _render_markdown_table_svg(table_lines: list[str]) -> Optional[str]:
 
 
 def _extract_markdown_table_blocks(text: str) -> tuple[list[str], str]:
-    """Extract Markdown pipe tables from *text* and render them as SVG files."""
+    """Extract Markdown pipe tables from *text* and render them as PNG files."""
     if '|' not in text or '-' not in text:
         return [], text
 
     lines = text.split('\n')
     out: list[str] = []
-    svgs: list[str] = []
+    pngs: list[str] = []
     in_fence = False
     i = 0
     while i < len(lines):
@@ -316,16 +316,16 @@ def _extract_markdown_table_blocks(text: str) -> tuple[list[str], str]:
                 i += 1
                 continue
 
-            svg_path = _render_markdown_table_svg(table_block)
-            if svg_path:
-                svgs.append(svg_path)
+            png_path = _render_markdown_table_png(table_block)
+            if png_path:
+                pngs.append(png_path)
                 i = j
                 continue
 
         out.append(line)
         i += 1
 
-    return svgs, '\n'.join(out)
+    return pngs, '\n'.join(out)
 
 
 class TelegramAdapter(BasePlatformAdapter):
@@ -386,10 +386,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     def extract_media(self, content: str):
-        """Extract explicit MEDIA tags and auto-render Markdown tables as SVG files."""
+        """Extract explicit MEDIA tags and auto-render Markdown tables as PNG files."""
         media_files, cleaned = super().extract_media(content)
-        table_svgs, cleaned = _extract_markdown_table_blocks(cleaned)
-        media_files.extend((svg_path, False) for svg_path in table_svgs)
+        table_pngs, cleaned = _extract_markdown_table_blocks(cleaned)
+        media_files.extend((png_path, False) for png_path in table_pngs)
         return media_files, cleaned
 
     @staticmethod
@@ -1345,7 +1345,7 @@ class TelegramAdapter(BasePlatformAdapter):
         
         try:
             # Extract media attachments first so Markdown tables can be rendered
-            # as SVG files, then format the remaining text for Telegram.
+            # as PNG files, then format the remaining text for Telegram.
             media_files, content = self.extract_media(content)
             formatted = self.format_message(content)
             if not formatted or not formatted.strip():
