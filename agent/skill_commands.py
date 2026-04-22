@@ -36,6 +36,19 @@ _INLINE_SHELL_RE = re.compile(r"!`([^`\n]+)`")
 _INLINE_SHELL_MAX_OUTPUT = 4000
 
 
+def _coerce_skill_priority(frontmatter: Dict[str, Any]) -> int:
+    """Return the skill priority as an integer (higher = earlier).
+
+    Skills without an explicit priority default to 0. Invalid values are
+    treated as 0 so metadata mistakes don't break scanning.
+    """
+    priority = frontmatter.get("priority", 0)
+    try:
+        return int(priority)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _load_skills_config() -> dict:
     """Load the ``skills`` section of config.yaml (best-effort)."""
     try:
@@ -377,6 +390,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                                 description = line[:80]
                                 break
                     seen_names.add(name)
+                    priority = _coerce_skill_priority(frontmatter)
                     # Normalize to hyphen-separated slug, stripping
                     # non-alnum chars (e.g. +, /) to avoid invalid
                     # Telegram command names downstream.
@@ -388,6 +402,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     _skill_commands[f"/{cmd_name}"] = {
                         "name": name,
                         "description": description or f"Invoke the {name} skill",
+                        "priority": priority,
                         "skill_md_path": str(skill_md),
                         "skill_dir": str(skill_md.parent),
                     }

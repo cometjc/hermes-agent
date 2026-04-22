@@ -430,6 +430,19 @@ def _sanitize_telegram_name(raw: str) -> str:
     return name.strip("_")
 
 
+def _skill_priority(info: dict[str, Any]) -> int:
+    """Return a sortable priority for a skill command entry.
+
+    Higher numbers sort earlier. Invalid or missing values fall back to 0.
+    """
+    priority = info.get("priority", 0)
+    try:
+        return int(priority)
+    except (TypeError, ValueError):
+        return 0
+
+
+
 def _clamp_command_names(
     entries: list[tuple[str, str]],
     reserved: set[str],
@@ -546,7 +559,7 @@ def _collect_gateway_skill_entries(
         _skills_dir = str(SKILLS_DIR.resolve())
         _hub_dir = str((SKILLS_DIR / ".hub").resolve())
         skill_cmds = get_skill_commands()
-        for cmd_key in sorted(skill_cmds):
+        for cmd_key in sorted(skill_cmds, key=lambda key: (-_skill_priority(skill_cmds[key]), key)):
             info = skill_cmds[cmd_key]
             skill_path = info.get("skill_md_path", "")
             if not skill_path.startswith(_skills_dir):
@@ -694,7 +707,7 @@ def discord_skill_commands_by_category(
         _hub_dir = (SKILLS_DIR / ".hub").resolve()
         skill_cmds = get_skill_commands()
 
-        for cmd_key in sorted(skill_cmds):
+        for cmd_key in sorted(skill_cmds, key=lambda key: (-_skill_priority(skill_cmds[key]), key)):
             info = skill_cmds[cmd_key]
             skill_path = info.get("skill_md_path", "")
             if not skill_path:

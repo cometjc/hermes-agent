@@ -46,6 +46,12 @@ class TestScanSkillCommands:
         assert "/my-skill" in result
         assert result["/my-skill"]["name"] == "my-skill"
 
+    def test_priority_is_preserved_from_frontmatter(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "priority-skill", frontmatter_extra="priority: 42\n")
+            result = scan_skill_commands()
+        assert result["/priority-skill"]["priority"] == 42
+
     def test_empty_dir(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             result = scan_skill_commands()

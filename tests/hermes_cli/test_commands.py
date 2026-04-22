@@ -755,6 +755,39 @@ class TestTelegramMenuCommands:
         assert "my_enabled_skill" in menu_names
         assert "my_disabled_skill" not in menu_names
 
+    def test_priority_skills_sort_before_lower_priority_ones(self, tmp_path, monkeypatch):
+        """Priority metadata should bring important skills into the Telegram menu first."""
+        from unittest.mock import patch
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        fake_skills_dir = tmp_path / "skills"
+        fake_cmds = {
+            "/aardvark": {
+                "name": "aardvark",
+                "description": "Lower priority",
+                "priority": 0,
+                "skill_md_path": f"{fake_skills_dir}/aardvark/SKILL.md",
+                "skill_dir": f"{fake_skills_dir}/aardvark",
+            },
+            "/systematic-debugging": {
+                "name": "systematic-debugging",
+                "description": "Debugging skill",
+                "priority": 1000,
+                "skill_md_path": f"{fake_skills_dir}/systematic-debugging/SKILL.md",
+                "skill_dir": f"{fake_skills_dir}/systematic-debugging",
+            },
+        }
+        with (
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", fake_skills_dir),
+            patch("hermes_cli.commands.telegram_bot_commands", return_value=[("help", "Help")]),
+        ):
+            fake_skills_dir.mkdir(exist_ok=True)
+            menu, hidden = telegram_menu_commands(max_commands=2)
+
+        assert menu == [("help", "Help"), ("systematic_debugging", "Debugging skill")]
+        assert hidden == 1
+
     def test_special_chars_in_skill_names_sanitized(self, tmp_path, monkeypatch):
         """Skills with +, /, or other special chars produce valid Telegram names."""
         from unittest.mock import patch
