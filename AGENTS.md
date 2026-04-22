@@ -572,6 +572,10 @@ scripts/run_tests.sh tests/agent/test_foo.py::test_x  # one test
 scripts/run_tests.sh -v --tb=long                     # pass-through pytest flags
 ```
 
+### Test selection
+
+Because the hermes test suite is large, each test run should target only the pytest cases that are directly related to the current change. Prefer the smallest relevant subset first (single test, file, or directory) and expand the scope only when the change spans multiple areas or the targeted run reveals evidence that broader coverage is needed.
+
 ### Why the wrapper (and why the old "just call pytest" doesn't work)
 
 Five real sources of local-vs-CI drift the script closes:
