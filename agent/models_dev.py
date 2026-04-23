@@ -110,6 +110,8 @@ class ModelInfo:
             caps.append("reasoning")
         if self.tool_call:
             caps.append("tools")
+        if self.supports_steering:
+            caps.append("steering")
         if self.supports_vision():
             caps.append("vision")
         if self.supports_pdf():
@@ -315,6 +317,7 @@ class ModelCapabilities:
     supports_tools: bool = True
     supports_vision: bool = False
     supports_reasoning: bool = False
+    supports_steering: bool = False
     context_window: int = 200000
     max_output_tokens: int = 8192
     model_family: str = ""
@@ -370,6 +373,7 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
       - limit.context (int) → context_window
       - limit.output  (int) → max_output_tokens
       - family     (str)   → model_family
+      - supports_steering / steering (bool) → supports_steering
     """
     models = _get_provider_models(provider)
     if models is None:
@@ -390,6 +394,7 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
         input_mods = []
     supports_vision = bool(entry.get("attachment", False)) or "image" in input_mods
     supports_reasoning = bool(entry.get("reasoning", False))
+    supports_steering = bool(entry.get("supports_steering", entry.get("steering", supports_tools or supports_reasoning)))
 
     # Extract limits
     limit = entry.get("limit", {})
@@ -408,6 +413,7 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
         supports_tools=supports_tools,
         supports_vision=supports_vision,
         supports_reasoning=supports_reasoning,
+        supports_steering=supports_steering,
         context_window=context_window,
         max_output_tokens=max_output_tokens,
         model_family=model_family,

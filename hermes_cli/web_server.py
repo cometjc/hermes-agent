@@ -890,6 +890,7 @@ def get_model_info():
                     "supports_tools": mc.supports_tools,
                     "supports_vision": mc.supports_vision,
                     "supports_reasoning": mc.supports_reasoning,
+                    "supports_steering": mc.supports_steering,
                     "context_window": mc.context_window,
                     "max_output_tokens": mc.max_output_tokens,
                     "model_family": mc.model_family,

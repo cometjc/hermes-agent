@@ -28,7 +28,8 @@ import time
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+import uuid
 from typing import Dict, Optional, Any, List
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
@@ -681,6 +682,7 @@ class GatewayRunner:
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
         self._session_run_generation: Dict[str, int] = {}
+        self._steering_failed_sessions: Dict[str, bool] = {}  # Session-scoped steer failure latch
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -1067,6 +1069,24 @@ class GatewayRunner:
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
+
+    def _build_telegram_clarify_callback(self, source: SessionSource):
+        """Return a Telegram clarify callback for this source, if supported."""
+        if source.platform != Platform.TELEGRAM:
+            return None
+        adapter = self.adapters.get(source.platform)
+        build = getattr(adapter, "build_clarify_callback", None)
+        if not callable(build) or not source.user_id:
+            return None
+        try:
+            return build(
+                chat_id=source.chat_id,
+                thread_id=source.thread_id,
+                user_id=source.user_id,
+            )
+        except Exception as exc:
+            logger.debug("Failed to build Telegram clarify callback for %s: %s", source.description, exc)
+            return None
 
     def _resolve_session_agent_runtime(
         self,
@@ -1548,7 +1568,162 @@ class GatewayRunner:
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
             return
-        merge_pending_message_event(adapter._pending_messages, session_key, event)
+        merge_pending_message_event(adapter._pending_messages, session_key, event, merge_text=True)
+        session_store = getattr(self, "session_store", None)
+        if session_store is None:
+            return
+        try:
+            session_store.add_pending_item(
+                session_key,
+                "queue",
+                self._build_pending_item(
+                    event,
+                    "queue",
+                    self._load_pending_ttl_spec(event.source.platform, "queue"),
+                ),
+            )
+        except Exception:
+            pass
+
+    def _clear_steering_failure(self, session_key: str) -> None:
+        failures = getattr(self, "_steering_failed_sessions", None)
+        if isinstance(failures, dict):
+            failures.pop(session_key, None)
+
+    def _mark_steering_failed(self, session_key: str) -> None:
+        failures = getattr(self, "_steering_failed_sessions", None)
+        if failures is None:
+            failures = {}
+            self._steering_failed_sessions = failures
+        failures[session_key] = True
+
+    def _agent_supports_steering(self, agent: Any, session_key: str) -> bool:
+        failures = getattr(self, "_steering_failed_sessions", {})
+        if not agent or failures.get(session_key):
+            return False
+        supports = getattr(agent, "supports_steering", None)
+        if callable(supports):
+            try:
+                supports = supports()
+            except Exception:
+                supports = False
+        if supports is None:
+            supports = hasattr(agent, "steer")
+        return bool(supports)
+
+    @staticmethod
+    def _parse_pending_ttl_spec(spec: Any) -> Optional[timedelta]:
+        """Parse `permanent` / duration strings like `30m`, `2h`, `90s`."""
+        if spec is None:
+            return None
+        text = str(spec).strip().lower()
+        if not text or text == "permanent":
+            return None
+        match = re.fullmatch(r"(?P<num>\d+)(?P<unit>[smhd])", text)
+        if not match:
+            return None
+        value = int(match.group("num"))
+        unit = match.group("unit")
+        if unit == "s":
+            return timedelta(seconds=value)
+        if unit == "m":
+            return timedelta(minutes=value)
+        if unit == "h":
+            return timedelta(hours=value)
+        if unit == "d":
+            return timedelta(days=value)
+        return None
+
+    @staticmethod
+    def _load_pending_ttl_spec(platform: Platform, kind: str) -> Any:
+        """Load the configured TTL spec for a pending routing kind."""
+        cfg = _load_gateway_config()
+        display = cfg.get("display", {}) if isinstance(cfg, dict) else {}
+        platform_cfg = {}
+        if isinstance(display, dict):
+            platforms = display.get("platforms", {})
+            if isinstance(platforms, dict):
+                platform_cfg = platforms.get(platform.value, {}) or {}
+        key = f"pending_{kind}_ttl"
+        if isinstance(platform_cfg, dict) and key in platform_cfg:
+            return platform_cfg.get(key)
+        return display.get(key) if isinstance(display, dict) else None
+
+    def _build_pending_item(self, event: MessageEvent, kind: str, ttl_spec: Any = None) -> dict:
+        now = datetime.now()
+        ttl = self._parse_pending_ttl_spec(ttl_spec)
+        expires_at = (now + ttl).isoformat() if ttl is not None else None
+        sender_name = getattr(event.source, "user_name", None) or getattr(event.source, "chat_name", None) or ""
+        return {
+            "id": uuid.uuid4().hex,
+            "kind": kind,
+            "status": "pending",
+            "text": event.text,
+            "sender_name": sender_name,
+            "sender_id": event.source.user_id,
+            "chat_id": event.source.chat_id,
+            "thread_id": event.source.thread_id,
+            "message_id": event.message_id,
+            "created_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+            "expires_at": expires_at,
+        }
+
+    def _reset_pending_routing_after_model_switch(self, session_key: str) -> None:
+        """Re-enable steering after /model and reclassify queued items."""
+        session_store = getattr(self, "session_store", None)
+        if session_store is not None:
+            try:
+                session_store.set_steering_failed(session_key, False)
+            except Exception:
+                pass
+            try:
+                session_store.reclassify_pending_queue(session_key)
+            except Exception:
+                pass
+        self._clear_steering_failure(session_key)
+
+    async def _telegram_busy_route_feedback(
+        self,
+        adapter: Any,
+        event: MessageEvent,
+        *,
+        emoji: str,
+        fallback_text: str,
+    ) -> None:
+        chat_id = getattr(event.source, "chat_id", None)
+        message_id = getattr(event, "message_id", None)
+        thread_meta = {"thread_id": event.source.thread_id} if getattr(event.source, "thread_id", None) else None
+        reactions_enabled = False
+        _reactions_enabled = getattr(adapter, "_reactions_enabled", None)
+        if callable(_reactions_enabled):
+            try:
+                reactions_enabled = bool(_reactions_enabled())
+            except Exception:
+                reactions_enabled = False
+        if reactions_enabled:
+            try:
+                if await adapter._set_reaction(chat_id, message_id, emoji):
+                    return
+            except Exception:
+                logger.debug(
+                    "[%s] Telegram busy route reaction failed",
+                    getattr(self, "name", "gateway"),
+                    exc_info=True,
+                )
+        try:
+            await adapter._send_with_retry(
+                chat_id=chat_id,
+                content=fallback_text,
+                reply_to=message_id,
+                metadata=thread_meta,
+            )
+        except Exception as exc:
+            logger.debug(
+                "[%s] Telegram busy route fallback failed: %s",
+                getattr(self, "name", "gateway"),
+                exc,
+            )
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Draining case (gateway restarting/stopping) ---
@@ -1572,13 +1747,98 @@ class GatewayRunner:
             )
             return True
 
-        # Normal busy case (agent actively running a task)
+        # --- Normal busy case (agent actively running a task) ---
+        # Telegram gets the new steer/queue routing: if the running session can
+        # absorb steering, inject the follow-up mid-run; otherwise queue it for
+        # the next turn.  Other platforms keep the existing interrupt+ack path.
+
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
             return False  # let default path handle it
 
-        # Store the message so it's processed as the next turn after the
-        # current run finishes (or is interrupted).
+        is_telegram = event.source.platform == Platform.TELEGRAM
+        running_agent = self._running_agents.get(session_key)
+
+        if is_telegram:
+            if running_agent is _AGENT_PENDING_SENTINEL:
+                self._queue_or_replace_pending_event(session_key, event)
+                await self._telegram_busy_route_feedback(
+                    adapter,
+                    event,
+                    emoji="⏸️",
+                    fallback_text="[QUEUE] 已排入下一輪，稍後處理。",
+                )
+                return True
+
+            if self._agent_supports_steering(running_agent, session_key):
+                session_store = getattr(self, "session_store", None)
+                if session_store is not None:
+                    try:
+                        session_store.add_pending_item(
+                            session_key,
+                            "steer",
+                            self._build_pending_item(
+                                event,
+                                "steer",
+                                self._load_pending_ttl_spec(event.source.platform, "steer"),
+                            ),
+                        )
+                    except Exception:
+                        pass
+                try:
+                    accepted = bool(running_agent.steer(event.text))
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Telegram busy steer failed for session %s: %s",
+                        getattr(self, "name", "gateway"),
+                        session_key,
+                        exc,
+                    )
+                    accepted = False
+                    self._mark_steering_failed(session_key)
+                else:
+                    if accepted:
+                        self._clear_steering_failure(session_key)
+                        if session_store is not None:
+                            try:
+                                session_store.pop_pending_item(session_key, "steer")
+                            except Exception:
+                                pass
+                        await self._telegram_busy_route_feedback(
+                            adapter,
+                            event,
+                            emoji="\U0001f9ed",
+                            fallback_text="[STEER] 已送入本次執行，稍後會接續處理。",
+                        )
+                        return True
+                    self._mark_steering_failed(session_key)
+
+                if session_store is not None:
+                    try:
+                        session_store.set_steering_failed(session_key, True)
+                    except Exception:
+                        pass
+                    try:
+                        session_store.pop_pending_item(session_key, "steer")
+                    except Exception:
+                        pass
+
+            self._queue_or_replace_pending_event(session_key, event)
+            await self._telegram_busy_route_feedback(
+                adapter,
+                event,
+                emoji="⏸️",
+                fallback_text="⏸️ [QUEUE] 已排入下一輪，稍後處理。",
+            )
+            return True
+
+        # --- Legacy busy case for non-Telegram platforms ---
+        # The user sent a message while the agent is working.  Interrupt the
+        # agent immediately so it stops the current tool-calling loop and
+        # processes the new message.  The pending message is stored in the
+        # adapter so the base adapter picks it up once the interrupted run
+        # returns.  A brief ack tells the user what's happening (debounced
+        # to avoid spam when they fire multiple messages quickly).
         from gateway.platforms.base import merge_pending_message_event
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
@@ -1587,7 +1847,6 @@ class GatewayRunner:
         # If not in queue mode, interrupt the running agent immediately.
         # This aborts in-flight tool calls and causes the agent loop to exit
         # at the next check point.
-        running_agent = self._running_agents.get(session_key)
         if not is_queue_mode and running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             try:
                 running_agent.interrupt(event.text)
@@ -1600,7 +1859,7 @@ class GatewayRunner:
         now = time.time()
         last_ack = self._busy_ack_ts.get(session_key, 0)
         if now - last_ack < _BUSY_ACK_COOLDOWN:
-            return True  # interrupt sent (if not queue), ack already delivered recently
+            return True  # ack already delivered recently
 
         self._busy_ack_ts[session_key] = now
 
@@ -3418,6 +3677,18 @@ class GatewayRunner:
                         channel_prompt=event.channel_prompt,
                     )
                     adapter._pending_messages[_quick_key] = queued_event
+                    try:
+                        self.session_store.add_pending_item(
+                            _quick_key,
+                            "queue",
+                            self._build_pending_item(
+                                queued_event,
+                                "queue",
+                                self._load_pending_ttl_spec(source.platform, "queue"),
+                            ),
+                        )
+                    except Exception:
+                        pass
                 return "Queued for the next turn."
 
             # /steer <prompt> — inject mid-run after the next tool call.
@@ -3442,6 +3713,18 @@ class GatewayRunner:
                             channel_prompt=event.channel_prompt,
                         )
                         adapter._pending_messages[_quick_key] = queued_event
+                        try:
+                            self.session_store.add_pending_item(
+                                _quick_key,
+                                "queue",
+                                self._build_pending_item(
+                                    queued_event,
+                                    "queue",
+                                    self._load_pending_ttl_spec(source.platform, "queue"),
+                                ),
+                            )
+                        except Exception:
+                            pass
                     return "Agent still starting — /steer queued for the next turn."
                 if running_agent and hasattr(running_agent, "steer"):
                     try:
@@ -3464,6 +3747,18 @@ class GatewayRunner:
                         channel_prompt=event.channel_prompt,
                     )
                     adapter._pending_messages[_quick_key] = queued_event
+                    try:
+                        self.session_store.add_pending_item(
+                            _quick_key,
+                            "queue",
+                            self._build_pending_item(
+                                queued_event,
+                                "queue",
+                                self._load_pending_ttl_spec(source.platform, "queue"),
+                            ),
+                        )
+                    except Exception:
+                        pass
                 return "No active agent — /steer queued for the next turn."
 
             # /model dispatches directly to the handler even mid-run. The
@@ -5066,6 +5361,7 @@ class GatewayRunner:
         # Clear any session-scoped model override so the next agent picks up
         # the configured default instead of the previously switched model.
         self._session_model_overrides.pop(session_key, None)
+        self._clear_steering_failure(session_key)
 
         # Clear session-scoped dangerous-command approvals and /yolo state.
         # /new is a conversation-boundary operation — approval state from the
@@ -5650,6 +5946,7 @@ class GatewayRunner:
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
                         }
+                        _self._reset_pending_routing_after_model_switch(_session_key)
 
                         # Evict cached agent so the next turn creates a fresh
                         # agent from the override rather than relying on the
@@ -5777,6 +6074,7 @@ class GatewayRunner:
             "base_url": result.base_url,
             "api_mode": result.api_mode,
         }
+        self._reset_pending_routing_after_model_switch(session_key)
 
         # Evict cached agent so the next turn creates a fresh agent from the
         # override rather than relying on cache signature mismatch detection.
@@ -6582,6 +6880,7 @@ class GatewayRunner:
                     chat_name=source.chat_name,
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
+                    clarify_callback=self._build_telegram_clarify_callback(source),
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
@@ -8850,7 +9149,14 @@ class GatewayRunner:
             await adapter.interrupt_session_activity(session_key, source.chat_id)
         if adapter and hasattr(adapter, "get_pending_message"):
             adapter.get_pending_message(session_key)  # consume and discard
+        session_store = getattr(self, "session_store", None)
+        if session_store is not None:
+            try:
+                session_store.clear_pending_routing(session_key)
+            except Exception:
+                pass
         self._pending_messages.pop(session_key, None)
+        self._clear_steering_failure(session_key)
         if release_running_state:
             self._release_running_agent_state(session_key)
 
@@ -9906,6 +10212,7 @@ class GatewayRunner:
                     chat_name=source.chat_name,
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
+                    clarify_callback=self._build_telegram_clarify_callback(source),
                     gateway_session_key=session_key,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
