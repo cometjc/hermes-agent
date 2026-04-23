@@ -539,7 +539,7 @@ The bot can add emoji reactions to messages as visual processing feedback:
 - ✅ when the response is delivered successfully
 - ❌ if an error occurs during processing
 
-Reactions are **disabled by default**. Enable them in `config.yaml`:
+Reactions are **enabled by default**. Disable them in `config.yaml` if needed:
 
 ```yaml
 telegram:

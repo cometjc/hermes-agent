@@ -120,7 +120,7 @@ class TestTelegramBusyRouting:
         adapter._set_reaction.assert_awaited_once_with(
             "123",
             "msg1",
-            "🧭",
+            "⚡",
         )
         adapter._send_with_retry.assert_not_awaited()
         assert sk not in runner._steering_failed_sessions
@@ -151,7 +151,7 @@ class TestTelegramBusyRouting:
         adapter._set_reaction.assert_awaited_once_with(
             "123",
             "msg1",
-            "⏸️",
+            "😴",
         )
         adapter._send_with_retry.assert_not_awaited()
 
@@ -180,7 +180,7 @@ class TestTelegramBusyRouting:
         adapter._set_reaction.assert_awaited_once_with(
             "123",
             "msg1",
-            "⏸️",
+            "😴",
         )
         adapter._send_with_retry.assert_not_awaited()
 

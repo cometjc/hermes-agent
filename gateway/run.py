@@ -1807,7 +1807,7 @@ class GatewayRunner:
                         await self._telegram_busy_route_feedback(
                             adapter,
                             event,
-                            emoji="\U0001f9ed",
+                            emoji="⚡",
                             fallback_text="[STEER] 已送入本次執行，稍後會接續處理。",
                         )
                         return True
@@ -1827,7 +1827,7 @@ class GatewayRunner:
             await self._telegram_busy_route_feedback(
                 adapter,
                 event,
-                emoji="⏸️",
+                emoji="😴",
                 fallback_text="⏸️ [QUEUE] 已排入下一輪，稍後處理。",
             )
             return True
@@ -1840,6 +1840,31 @@ class GatewayRunner:
         # returns.  A brief ack tells the user what's happening (debounced
         # to avoid spam when they fire multiple messages quickly).
         from gateway.platforms.base import merge_pending_message_event
+
+        running_agent = self._running_agents.get(session_key)
+        session_entry = None
+        try:
+            session_entry = self.session_store.get_or_create_session(event.source)
+        except Exception:
+            session_entry = None
+
+        is_telegram = event.source.platform == Platform.TELEGRAM
+        supports_steering = bool(
+            is_telegram
+            and running_agent
+            and running_agent is not _AGENT_PENDING_SENTINEL
+            and self._agent_supports_steering(running_agent, session_key)
+        )
+        kind = "steer" if supports_steering else "queue"
+        ttl_spec = self._load_pending_ttl_spec(event.source.platform, kind)
+        pending_item = self._build_pending_item(event, kind, ttl_spec)
+
+        if session_entry is not None:
+            try:
+                self.session_store.add_pending_item(session_key, kind, pending_item)
+            except Exception:
+                pass
+
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
         is_queue_mode = self._busy_input_mode == "queue"
