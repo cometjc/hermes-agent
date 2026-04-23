@@ -9821,6 +9821,7 @@ class GatewayRunner:
             # Build progress message with primary argument preview
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
+            path_like_tools = {"read_file", "write_file", "patch", "search_files"}
             
             # Verbose mode: show detailed arguments, respects tool_preview_length
             if progress_mode == "verbose":
@@ -9850,7 +9851,10 @@ class GatewayRunner:
                 _cap = _pl if _pl > 0 else 40
                 if len(preview) > _cap:
                     preview = preview[:_cap - 3] + "..."
-                msg = f"{emoji} {tool_name}: \"{preview}\""
+                if tool_name in path_like_tools:
+                    msg = f"{emoji} {tool_name} {preview}"
+                else:
+                    msg = f"{emoji} {tool_name}: \"{preview}\""
             else:
                 msg = f"{emoji} {tool_name}..."
             

@@ -6,7 +6,6 @@ Used by AIAgent._execute_tool_calls for CLI feedback.
 
 import logging
 import os
-import re
 import sys
 import threading
 import time
@@ -168,34 +167,47 @@ def _oneline(text: str) -> str:
     return " ".join(text.split())
 
 
-# Matches a leading `cd <path> && ` (one or more), so chained prefixes like
-# `cd a && cd b && real_cmd` collapse to `real_cmd`.  The path token is
-# permissive: any run of non-whitespace, quoted, or ${...}/$(...) segments.
-# Whitespace inside single/double quotes is preserved.  We intentionally do
-# NOT try to handle `cd foo; real_cmd` — semicolon-chained cds are rare and
-# have different short-circuit semantics.
-_LEADING_CD_RE = re.compile(
-    r'^\s*cd\s+'
-    r'(?:"[^"]*"|\'[^\']*\'|\S+)'
-    r'\s*&&\s*'
-)
+def _relpath(path: str) -> str:
+    """Return *path* relative to the current working directory when possible."""
+    if not path:
+        return ""
+    try:
+        return os.path.relpath(os.path.expanduser(str(path)), start=os.getcwd())
+    except Exception:
+        return str(path)
 
 
-def _strip_leading_cd(cmd: str) -> str:
-    """Strip leading ``cd <path> && `` prefixes from a shell command.
+def _progress_path(args: dict, *, tool_name: str | None = None) -> str:
+    """Extract a display path for progress messages, relative to $PWD."""
+    if not isinstance(args, dict):
+        return ""
 
-    Useful for display / preview — the real command after ``cd`` is what a
-    reader wants to see.  Preserves the command untouched when there's no
-    leading ``cd ... &&`` or when the pattern doesn't cleanly match.
-    """
-    out = cmd
-    # Cap iterations to guard against pathological input.
-    for _ in range(4):
-        m = _LEADING_CD_RE.match(out)
-        if not m:
-            break
-        out = out[m.end():]
-    return out if out else cmd
+    for key in ("path", "file_path", "target_path"):
+        value = args.get(key)
+        if value:
+            return _relpath(str(value))
+
+    if tool_name == "skill_manage":
+        value = args.get("file_path")
+        if value:
+            return _relpath(str(value))
+
+    return ""
+
+
+def _shorten(text: str, max_len: int) -> str:
+    """Trim text to *max_len* characters with an ellipsis."""
+    text = _oneline(str(text))
+    if max_len <= 0 or len(text) <= max_len:
+        return text
+    if max_len <= 3:
+        return text[:max_len]
+    return text[: max_len - 3] + "..."
+
+
+def _format_patch_fence(block: str) -> str:
+    """Wrap patch content in a fenced markdown code block."""
+    return f"```patch\n{block.rstrip()}\n```" if block else ""
 
 
 def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -> str | None:
@@ -230,7 +242,7 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         if sid:
             parts.append(sid[:16])
         if data:
-            parts.append(f'"{_oneline(data[:20])}"')
+            parts.append(f'"{_shorten(data, 20)}"')
         if timeout_val and action == "wait":
             parts.append(f"{timeout_val}s")
         return " ".join(parts) if parts else None
@@ -244,6 +256,32 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
             return f"updating {len(todos_arg)} task(s)"
         else:
             return f"planning {len(todos_arg)} task(s)"
+
+    if tool_name == "read_file":
+        path = _progress_path(args, tool_name=tool_name)
+        offset = args.get("offset", 1)
+        return f"{path} @ line {offset}" if path else f"line {offset}"
+
+    if tool_name == "write_file":
+        path = _progress_path(args, tool_name=tool_name)
+        if path:
+            return path
+        return None
+
+    if tool_name == "patch":
+        path = _progress_path(args, tool_name=tool_name)
+        if path:
+            return path
+        return None
+
+    if tool_name == "search_files":
+        target = args.get("target", "content")
+        pattern = _shorten(args.get("pattern", ""), 35)
+        path = _progress_path(args, tool_name=tool_name)
+        base = "files" if target == "files" else "content"
+        if path:
+            return f"{base} {pattern} in {path}" if pattern else f"{base} in {path}"
+        return f"{base} {pattern}" if pattern else base
 
     if tool_name == "session_search":
         query = _oneline(args.get("query", ""))
@@ -284,22 +322,6 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
             "rl_test_inference": f"{args.get('num_steps', 3)} steps",
         }
         return rl_previews.get(tool_name)
-
-    # Terminal: collapse leading `cd <path> && ...` so the short preview
-    # shows the real command rather than the cd prefix.  Common agent habit
-    # `cd /long/path && git log` otherwise truncates to "cd /long/path..."
-    # in platforms that cap the preview (gateway default 40 chars), hiding
-    # all signal about what was actually run.  Prefer the `workdir` tool
-    # parameter; this fallback handles the case when we forget.
-    if tool_name == "terminal":
-        cmd = _oneline(str(args.get("command", "")))
-        if cmd:
-            cmd = _strip_leading_cd(cmd)
-        if not cmd:
-            return None
-        if max_len > 0 and len(cmd) > max_len:
-            cmd = cmd[:max_len - 3] + "..."
-        return cmd
 
     key = primary_args.get(tool_name)
     if not key:
@@ -479,14 +501,17 @@ def extract_edit_diff(
     return _diff_from_snapshot(snapshot)
 
 
-def _emit_inline_diff(diff_text: str, print_fn) -> bool:
-    """Emit rendered diff text through the CLI's prompt_toolkit-safe printer."""
-    if print_fn is None or not diff_text:
+def _emit_markdown_patch(title: str, patch_text: str, print_fn) -> bool:
+    """Emit a title line followed by a fenced patch block."""
+    if print_fn is None or not patch_text:
         return False
     try:
-        print_fn("  ┊ review diff")
-        for line in diff_text.rstrip("\n").splitlines():
+        if title:
+            print_fn(title)
+        print_fn("```patch")
+        for line in patch_text.rstrip("\n").splitlines():
             print_fn(line)
+        print_fn("```")
         return True
     except Exception:
         return False
@@ -610,7 +635,13 @@ def render_edit_diff_with_delta(
     except Exception as exc:
         logger.debug("Could not render inline diff: %s", exc)
         return False
-    return _emit_inline_diff("\n".join(rendered_lines), print_fn)
+
+    path = _progress_path(function_args or {}, tool_name=tool_name)
+    if not path and snapshot and snapshot.paths:
+        path = _display_diff_path(snapshot.paths[0])
+    emoji = get_tool_emoji(tool_name, default="⚡")
+    title = f"{emoji} {tool_name} {path}".rstrip()
+    return _emit_markdown_patch(title, "\n".join(rendered_lines), print_fn)
 
 
 # =========================================================================
@@ -896,16 +927,16 @@ def get_cute_tool_message(
     skin_prefix = get_skin_tool_prefix()
 
     def _trunc(s, n=40):
-        s = str(s)
+        s = _shorten(s, n)
         if _tool_preview_max_len == 0:
             return s  # no limit
-        return (s[:n-3] + "...") if len(s) > n else s
+        return s
 
     def _path(p, n=35):
-        p = str(p)
+        p = _relpath(str(p))
         if _tool_preview_max_len == 0:
             return p  # no limit
-        return ("..." + p[-(n-3):]) if len(p) > n else p
+        return _shorten(p, n)
 
     def _wrap(line: str) -> str:
         """Apply skin tool prefix and failure suffix."""
@@ -946,8 +977,12 @@ def get_cute_tool_message(
     if tool_name == "search_files":
         pattern = _trunc(args.get("pattern", ""), 35)
         target = args.get("target", "content")
+        path = _path(args.get("path", "."))
         verb = "find" if target == "files" else "grep"
-        return _wrap(f"┊ 🔎 {verb:9} {pattern}  {dur}")
+        detail = f"{target} {pattern}".strip()
+        if path:
+            detail = f"{detail} in {path}" if detail else path
+        return _wrap(f"┊ 🔎 {verb:9} {detail}  {dur}")
     if tool_name == "browser_navigate":
         url = args.get("url", "")
         domain = url.replace("https://", "").replace("http://", "").split("/")[0]
