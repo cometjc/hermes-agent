@@ -14,7 +14,8 @@ Responsibilities
   topic to reflect the current subagent's goal.  The rename call doubles
   as a liveness probe — if the user deleted the topic manually, Telegram
   returns ``topic_not_found`` and we transparently create a fresh one.
-* Keep subagent progress in a single Telegram message, editing it in place.
+* Keep subagent progress in a single Telegram message when it fits, and
+  roll over to a fresh Telegram message before hitting the hard limit.
 * Update ``last_message_ts`` on every successful forward so an external cron
   job can delete topics that have been idle for 24h.
 * Soft-fail gracefully: any exception is swallowed with a warning so the
@@ -57,6 +58,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Deque, Dict, Optional
 
 from hermes_constants import get_hermes_home
+from gateway.progress_batch import telegram_progress_chunks, telegram_progress_fits
 
 if TYPE_CHECKING:  # pragma: no cover — type-only imports
     from gateway.platforms.base import BasePlatformAdapter
@@ -454,19 +456,28 @@ class SubagentTopicRouter:
                 f"Goal: {goal_snippet}\n"
                 "— 無新訊息 24h 後此 topic 將被自動刪除"
             )
-            result = await adapter.send(
-                chat_id=parent_chat_id,
-                content=opening,
-                metadata={"thread_id": int(thread_id)},
-            )
-            if result.success:
+            chunks = telegram_progress_chunks(adapter, [opening])
+            if not chunks:
+                chunks = [opening]
+
+            last_result = None
+            for chunk in chunks:
+                last_result = await adapter.send(
+                    chat_id=parent_chat_id,
+                    content=chunk,
+                    metadata={"thread_id": int(thread_id)},
+                )
+                if not last_result.success:
+                    break
+
+            if last_result and last_result.success:
                 with _STATE_LOCK:
                     state = _load_state(self.state_path)
                     topic = state.get("topics", {}).get(session_id)
                     if topic is not None:
                         topic["goal"] = goal
-                        if result.message_id:
-                            topic["progress_message_id"] = str(result.message_id)
+                        if last_result.message_id:
+                            topic["progress_message_id"] = str(last_result.message_id)
                         topic["progress_rendered_text"] = opening
                         _save_state(self.state_path, state)
         except Exception as e:
@@ -691,7 +702,8 @@ class SubagentTopicRouter:
                     _save_state(self.state_path, state)
             return True
 
-        if message_id:
+        fits = telegram_progress_fits(adapter, [content])
+        if message_id and fits:
             try:
                 result = await adapter.edit_message(
                     chat_id=chat_id,
@@ -713,6 +725,11 @@ class SubagentTopicRouter:
                     "Subagent topic edit failed for session %s: %s",
                     session_id, e, exc_info=True,
                 )
+        elif message_id and not fits:
+            self.logger.info(
+                "Subagent topic rollover before Telegram limit for session %s",
+                session_id,
+            )
 
         try:
             result = await adapter.send(

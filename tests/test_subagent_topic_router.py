@@ -35,6 +35,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform
+from gateway.platforms.base import BasePlatformAdapter
 from gateway.subagent_topic_router import (
     SubagentTopicRouter,
     _clean_for_topic,
@@ -87,6 +88,13 @@ def non_telegram_source() -> SimpleNamespace:
 @pytest.fixture
 def adapter() -> MagicMock:
     mock = MagicMock(name="adapter")
+    mock.format_message = lambda content: content
+    mock.truncate_message = (
+        lambda content, max_length, len_fn=None: BasePlatformAdapter.truncate_message(
+            content, max_length, len_fn=len_fn
+        )
+    )
+    mock.MAX_MESSAGE_LENGTH = 4096
     mock.send = AsyncMock(
         return_value=SimpleNamespace(success=True, message_id="m1")
     )
@@ -569,6 +577,46 @@ class TestRouterAsyncRoute:
         assert entry["last_message_ts"] >= entry["created_ts"]
 
     @pytest.mark.asyncio
+    async def test_lazy_creates_topic_rolls_over_opening_message(
+        self,
+        router: SubagentTopicRouter,
+        telegram_source: SimpleNamespace,
+        adapter: MagicMock,
+        patched_topic_tool,
+    ):
+        calls = 0
+
+        async def _send_side_effect(**kwargs):
+            nonlocal calls
+            calls += 1
+            return SimpleNamespace(success=True, message_id=f"m{calls}")
+
+        adapter.send.side_effect = _send_side_effect
+        adapter.MAX_MESSAGE_LENGTH = 100
+        long_goal = "goal " + ("x" * 500)
+
+        await router._async_route(
+            session_id="sid_open_roll",
+            source=telegram_source,
+            event_type="subagent.start",
+            tool_name=None,
+            preview="kick off",
+            goal=long_goal,
+            adapter=adapter,
+        )
+
+        # Pointer + multiple opening chunks.
+        assert adapter.send.await_count > 2
+        assert adapter.edit_message.await_count == 1
+        opening_calls = adapter.send.call_args_list[1:]
+        assert len(opening_calls) > 1
+        assert all(call.kwargs["metadata"]["thread_id"] == 9999 for call in opening_calls)
+        loaded = _load_state(router.state_path)
+        entry = loaded["topics"]["sid_open_roll"]
+        assert entry["goal"] == long_goal
+        assert entry["progress_message_id"] is not None
+
+    @pytest.mark.asyncio
     async def test_second_event_after_create_sends_actual_event(
         self,
         router: SubagentTopicRouter,
@@ -687,6 +735,59 @@ class TestRouterAsyncRoute:
         loaded = _load_state(router.state_path)
         new_ts = loaded["topics"]["sid_ts"]["last_message_ts"]
         assert new_ts > old_ts
+
+    @pytest.mark.asyncio
+    async def test_rolls_over_before_telegram_limit(
+        self,
+        router: SubagentTopicRouter,
+        telegram_source: SimpleNamespace,
+        adapter: MagicMock,
+        patched_topic_tool,
+    ):
+        old_ts = time.time() - 10_000
+        _save_state(
+            router.state_path,
+            {
+                "version": 1,
+                "topics": {
+                    "sid_roll": {
+                        "chat_id": str(telegram_source.chat_id),
+                        "thread_id": "77",
+                        "topic_name": "SA roll",
+                        "created_ts": old_ts,
+                        "last_message_ts": old_ts,
+                        "parent_chat_id": str(telegram_source.chat_id),
+                        "parent_thread_id": None,
+                        "progress_message_id": "old-msg",
+                        "progress_rendered_text": "old text",
+                    }
+                },
+            },
+        )
+        adapter.MAX_MESSAGE_LENGTH = 600
+
+        long_preview = "x" * 700
+        await router._async_route(
+            session_id="sid_roll",
+            source=telegram_source,
+            event_type="subagent.progress",
+            tool_name=None,
+            preview=long_preview,
+            goal=None,
+            adapter=adapter,
+        )
+
+        adapter.edit_message.assert_not_awaited()
+        adapter.send.assert_awaited_once()
+        send_kwargs = adapter.send.call_args.kwargs
+        assert send_kwargs["chat_id"] == str(telegram_source.chat_id)
+        assert send_kwargs["metadata"]["thread_id"] == 77
+        assert long_preview in send_kwargs["content"]
+
+        loaded = _load_state(router.state_path)
+        entry = loaded["topics"]["sid_roll"]
+        assert entry["progress_message_id"] == "m1"
+        assert entry["last_message_ts"] > old_ts
 
     @pytest.mark.asyncio
     async def test_lazy_create_failure_blocklists(
