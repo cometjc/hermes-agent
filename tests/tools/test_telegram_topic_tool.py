@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from gateway.session_context import clear_session_vars, set_session_vars
 from tools.telegram_topic_tool import (
     _classify_error,
     _parse_telegram_target,
@@ -114,6 +115,56 @@ class TestValidation:
         result = json.loads(telegram_topic_tool({"action": "nuke", "target": "telegram:-100"}))
         assert "error" in result and "Unknown action" in result["error"]
 
+    def test_current_chat_id_reports_session_context(self, monkeypatch):
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="-1003837358001",
+            thread_id="1981",
+            chat_name="小蟹助手群",
+        )
+        try:
+            result = json.loads(telegram_topic_tool({"action": "current_chat_id"}))
+        finally:
+            clear_session_vars(tokens)
+
+        assert result["success"] is True
+        assert result["platform"] == "telegram"
+        assert result["chat_id"] == "-1003837358001"
+        assert result["thread_id"] == "1981"
+        assert result["chat_name"] == "小蟹助手群"
+
+    def test_create_defaults_to_current_chat_id_when_target_is_missing(self, monkeypatch):
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="-1003837358001",
+            thread_id="1981",
+        )
+        try:
+            bot = MagicMock()
+            bot.create_forum_topic = AsyncMock(
+                return_value=SimpleNamespace(message_thread_id=17585, name="debug-topic")
+            )
+            bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
+            _install_telegram_bot_mock(monkeypatch, bot)
+            _install_gateway_config(monkeypatch)
+
+            result = json.loads(telegram_topic_tool({"action": "create", "name": "debug-topic"}))
+        finally:
+            clear_session_vars(tokens)
+
+        assert result["success"] is True
+        assert result["chat_id"] == "-1003837358001"
+        assert result["thread_id"] == "17585"
+        bot.create_forum_topic.assert_awaited_once_with(chat_id=-1003837358001, name="debug-topic")
+
+    def test_create_requires_session_context_when_target_is_missing(self, monkeypatch):
+        clear_session_vars(set_session_vars())
+
+        result = json.loads(telegram_topic_tool({"action": "create", "name": "debug-topic"}))
+
+        assert "error" in result
+        assert "current telegram chat" in result["error"].lower()
+
     def test_create_requires_name(self):
         result = json.loads(telegram_topic_tool({"action": "create", "target": "telegram:-100"}))
         assert "error" in result and "name" in result["error"].lower()
@@ -141,9 +192,52 @@ class TestValidation:
 
 class TestWriteOps:
     def test_create_calls_bot_and_returns_thread_id(self, monkeypatch):
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="-1003837358001",
+            thread_id="1981",
+            chat_name="小蟹助手群",
+        )
+        try:
+            bot = MagicMock()
+            bot.create_forum_topic = AsyncMock(
+                return_value=SimpleNamespace(message_thread_id=17585, name="discuss-q3")
+            )
+            bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
+            _install_telegram_bot_mock(monkeypatch, bot)
+            _install_gateway_config(monkeypatch)
+
+            result = json.loads(telegram_topic_tool({
+                "action": "create",
+                "target": "telegram:-1001234567890",
+                "name": "discuss-q3",
+            }))
+        finally:
+            clear_session_vars(tokens)
+
+        assert result["success"] is True
+        assert result["action"] == "create"
+        assert result["thread_id"] == "17585"
+        assert result["name"] == "discuss-q3"
+        assert result["launch_agent"] is True
+        bot.create_forum_topic.assert_awaited_once_with(chat_id=-1001234567890, name="discuss-q3")
+        # Self-verify probe sends a service message to the new topic.
+        bot.send_message.assert_awaited_once()
+        probe_kwargs = bot.send_message.await_args.kwargs
+        assert probe_kwargs["chat_id"] == -1001234567890
+        assert probe_kwargs["message_thread_id"] == 17585
+        assert probe_kwargs["disable_notification"] is True
+        assert "Context:" in probe_kwargs["text"]
+        assert "小蟹助手群" in probe_kwargs["text"]
+        assert "1981" in probe_kwargs["text"]
+        assert result["launch_agent"] is True
+        assert "Context:" in result["kickoff_text"]
+
+    def test_create_launches_agent_with_context(self, monkeypatch):
         bot = MagicMock()
+        bot.username = "HermesBot"
         bot.create_forum_topic = AsyncMock(
-            return_value=SimpleNamespace(message_thread_id=17585, name="discuss-q3")
+            return_value=SimpleNamespace(message_thread_id=17777, name="research")
         )
         bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
         _install_telegram_bot_mock(monkeypatch, bot)
@@ -152,20 +246,16 @@ class TestWriteOps:
         result = json.loads(telegram_topic_tool({
             "action": "create",
             "target": "telegram:-1001234567890",
-            "name": "discuss-q3",
+            "name": "research",
+            "context": "Please investigate the outage and report back.",
+            "launch_agent": True,
         }))
 
         assert result["success"] is True
-        assert result["action"] == "create"
-        assert result["thread_id"] == "17585"
-        assert result["name"] == "discuss-q3"
-        bot.create_forum_topic.assert_awaited_once_with(chat_id=-1001234567890, name="discuss-q3")
-        # Self-verify probe sends a service message to the new topic.
-        bot.send_message.assert_awaited_once()
-        probe_kwargs = bot.send_message.await_args.kwargs
-        assert probe_kwargs["chat_id"] == -1001234567890
-        assert probe_kwargs["message_thread_id"] == 17585
-        assert probe_kwargs["disable_notification"] is True
+        assert result["launch_agent"] is True
+        assert "investigate the outage" in result["kickoff_text"]
+        assert "@HermesBot" in result["kickoff_text"]
+        assert bot.send_message.await_args.kwargs["text"].startswith("@HermesBot")
 
     def test_create_retries_once_when_thread_id_is_ghost(self, monkeypatch):
         """First create returns a ghost thread_id that fails probe; retry succeeds."""
@@ -399,5 +489,5 @@ class TestSchemaRegistration:
         assert entry.toolset == "messaging"
         assert entry.schema["name"] == "telegram_topic"
         assert set(entry.schema["parameters"]["properties"]["action"]["enum"]) == {
-            "create", "close", "reopen", "delete", "rename", "list",
+            "create", "close", "reopen", "delete", "rename", "list", "current_chat_id",
         }

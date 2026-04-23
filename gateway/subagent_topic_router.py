@@ -352,6 +352,17 @@ class SubagentTopicRouter:
                 chat_id=parent_chat_id,
                 thread_id=None,
                 name=topic_name,
+                launch_agent=False,
+            )
+        except TypeError as e:
+            if "launch_agent" not in str(e):
+                raise
+            result = await _run_topic_op(
+                token,
+                "create",
+                chat_id=parent_chat_id,
+                thread_id=None,
+                name=topic_name,
             )
         except Exception as e:
             code = _classify_error(e)

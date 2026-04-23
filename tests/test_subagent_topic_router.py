@@ -516,6 +516,7 @@ class TestRouterAsyncRoute:
         args, kwargs = patched_topic_tool.run_op.call_args
         assert args[1] == "create"
         assert kwargs["chat_id"] == str(telegram_source.chat_id)
+        assert kwargs["launch_agent"] is False
 
         # adapter.send is called 3 times on the create path:
         #   1. pointer message in parent chat
