@@ -9520,6 +9520,7 @@ class GatewayRunner:
                         buffer_threshold=_scfg.buffer_threshold,
                         cursor=_effective_cursor,
                         buffer_only=_buffer_only,
+                        transport=_scfg.transport,
                     )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
@@ -10173,6 +10174,7 @@ class GatewayRunner:
                             buffer_threshold=_scfg.buffer_threshold,
                             cursor=_effective_cursor,
                             buffer_only=_buffer_only,
+                            transport=_scfg.transport,
                         )
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,

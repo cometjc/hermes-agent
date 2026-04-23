@@ -1230,6 +1230,37 @@ class BasePlatformAdapter(ABC):
         """
         return SendResult(success=False, error="Not supported")
 
+    async def send_stream(
+        self,
+        chat_id: str,
+        content: str,
+        message_id: str | None = None,
+        reply_to: str | None = None,
+        *,
+        finalize: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        """Send or update a streaming message.
+
+        Default behavior preserves the existing gateway contract: the first
+        update sends a new message and subsequent updates edit it in place.
+        Platforms that support a native streaming transport (e.g. Telegram's
+        draft-based API) can override this hook.
+        """
+        if message_id is None:
+            return await self.send(
+                chat_id=chat_id,
+                content=content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        return await self.edit_message(
+            chat_id=chat_id,
+            message_id=message_id,
+            content=content,
+            finalize=finalize,
+        )
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """
         Send a typing indicator.

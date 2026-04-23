@@ -235,7 +235,7 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
                 - skill-x
             streaming:
               enabled: true
-              transport: edit
+              transport: native
           '';
           fixtureE = pkgs.writeText "fixture-e.yaml" ''
             mcp_servers:

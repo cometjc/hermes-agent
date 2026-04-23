@@ -191,7 +191,7 @@ class PlatformConfig:
 class StreamingConfig:
     """Configuration for real-time token streaming to messaging platforms."""
     enabled: bool = False
-    transport: str = "edit"       # "edit" (progressive editMessageText) or "off"
+    transport: str = "native"     # "native" (Telegram draft API, default), "edit" (progressive editMessageText), or "off"
     edit_interval: float = 1.0    # Seconds between message edits (Telegram rate-limits at ~1/s)
     buffer_threshold: int = 40    # Chars before forcing an edit
     cursor: str = " ▉"           # Cursor shown during streaming
@@ -211,7 +211,7 @@ class StreamingConfig:
             return cls()
         return cls(
             enabled=data.get("enabled", False),
-            transport=data.get("transport", "edit"),
+            transport=data.get("transport", "native"),
             edit_interval=float(data.get("edit_interval", 1.0)),
             buffer_threshold=int(data.get("buffer_threshold", 40)),
             cursor=data.get("cursor", " ▉"),

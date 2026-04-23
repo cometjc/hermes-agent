@@ -666,6 +666,24 @@ class TelegramAdapter(BasePlatformAdapter):
         return int(thread_id)
 
     @staticmethod
+    def _stream_draft_id(message_id: Optional[str], metadata: Optional[Dict[str, Any]]) -> int:
+        """Choose a stable draft id for native streaming.
+
+        Telegram's native draft endpoint needs a stable identifier for updates.
+        We prefer an explicit ``draft_id`` in metadata, then the current
+        message_id if it is numeric, and finally fall back to ``1``.
+        """
+        candidate: Any = None
+        if metadata:
+            candidate = metadata.get("draft_id")
+        if candidate is None and message_id not in (None, ""):
+            candidate = message_id
+        try:
+            return int(candidate)
+        except (TypeError, ValueError):
+            return 1
+
+    @staticmethod
     def _is_thread_not_found_error(error: Exception) -> bool:
         return "thread not found" in str(error).lower()
 
@@ -1535,6 +1553,75 @@ class TelegramAdapter(BasePlatformAdapter):
             err_str = str(e).lower()
             is_timeout = (_to and isinstance(e, _to)) or "timed out" in err_str
             return SendResult(success=False, error=str(e), retryable=not is_timeout)
+
+    async def send_stream(
+        self,
+        chat_id: str,
+        content: str,
+        message_id: str | None = None,
+        reply_to: Optional[str] = None,
+        *,
+        finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send or update a streaming Telegram message.
+
+        Native mode uses the Bot API draft endpoint when possible and falls
+        back to the ordinary send/edit behavior if the draft call fails.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        # Telegram's native draft API is the streaming transport for both
+        # intermediate and final updates.  Sending a brand-new message here
+        # would leave the draft visible and produce a duplicate final reply.
+
+        draft_id = self._stream_draft_id(message_id, metadata)
+        formatted = self.format_message(content)
+        thread_id = self._metadata_thread_id(metadata)
+        message_thread_id = self._message_thread_id_for_send(thread_id)
+
+        try:
+            payload: Dict[str, Any] = {
+                "chat_id": int(chat_id),
+                "draft_id": draft_id,
+                "text": formatted,
+            }
+            if message_thread_id is not None:
+                payload["message_thread_id"] = message_thread_id
+            payload.update(self._link_preview_kwargs())
+            response = await self._bot._post("sendMessageDraft", data=payload)
+            response_data = response if isinstance(response, dict) else {}
+            returned_id = (
+                response_data.get("draft_id")
+                or response_data.get("message_id")
+                or response_data.get("id")
+                or draft_id
+            )
+            return SendResult(
+                success=True,
+                message_id=str(returned_id),
+                raw_response=response_data or {"result": response},
+            )
+        except Exception as native_err:
+            logger.warning(
+                "[%s] Native Telegram draft streaming failed, falling back to legacy stream path: %s",
+                self.name,
+                native_err,
+            )
+            if message_id is None:
+                return await self.send(
+                    chat_id=chat_id,
+                    content=content,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+            return await self.edit_message(
+                chat_id=chat_id,
+                message_id=message_id,
+                content=content,
+                finalize=finalize,
+            )
 
     async def edit_message(
         self,

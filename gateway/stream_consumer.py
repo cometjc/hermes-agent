@@ -44,6 +44,7 @@ class StreamConsumerConfig:
     buffer_threshold: int = 40
     cursor: str = " ▉"
     buffer_only: bool = False
+    transport: str = "native"
 
 
 class GatewayStreamConsumer:
@@ -504,12 +505,20 @@ class GatewayStreamConsumer:
             return reply_to_id
         try:
             meta = dict(self.metadata) if self.metadata else {}
-            result = await self.adapter.send(
-                chat_id=self.chat_id,
-                content=text,
-                reply_to=reply_to_id,
-                metadata=meta,
-            )
+            if self.cfg.transport == "native":
+                result = await self.adapter.send_stream(
+                    chat_id=self.chat_id,
+                    content=text,
+                    reply_to=reply_to_id,
+                    metadata=meta,
+                )
+            else:
+                result = await self.adapter.send(
+                    chat_id=self.chat_id,
+                    content=text,
+                    reply_to=reply_to_id,
+                    metadata=meta,
+                )
             if result.success and result.message_id:
                 self._message_id = str(result.message_id)
                 self._already_sent = True
@@ -773,6 +782,28 @@ class GatewayStreamConsumer:
                 and self.cfg.cursor in text
                 and len(_visible_stripped) < _MIN_NEW_MSG_CHARS):
             return True  # too short for a standalone message — accumulate more
+        if self.cfg.transport == "native":
+            try:
+                result = await self.adapter.send_stream(
+                    chat_id=self.chat_id,
+                    content=text,
+                    message_id=(
+                        None if self._message_id in (None, "__no_edit__") else self._message_id
+                    ),
+                    finalize=finalize,
+                    metadata=self.metadata,
+                )
+                if result.success:
+                    self._already_sent = True
+                    self._last_sent_text = text
+                    self._flood_strikes = 0
+                    if result.message_id:
+                        self._message_id = str(result.message_id)
+                    return True
+                return False
+            except Exception as e:
+                logger.error("Stream native send/edit error: %s", e)
+                return False
         try:
             if self._message_id is not None:
                 if self._edit_supported:
