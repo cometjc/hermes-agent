@@ -1564,13 +1564,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
-        if finalize:
-            return await self.send(
-                chat_id=chat_id,
-                content=content,
-                reply_to=reply_to,
-                metadata=metadata,
-            )
+        # Telegram's native draft API is the streaming transport for both
+        # intermediate and final updates.  Sending a brand-new message here
+        # would leave the draft visible and produce a duplicate final reply.
 
         draft_id = self._stream_draft_id(message_id, metadata)
         formatted = self.format_message(content)

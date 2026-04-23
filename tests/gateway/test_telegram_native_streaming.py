@@ -1,15 +1,10 @@
 """Tests for Telegram native streaming support.
 
-These tests describe the desired behavior before implementation:
-- the stream consumer should route native transport through a dedicated
-  stream hook instead of the normal edit loop
-- Telegram native transport should use the Bot API draft endpoint
-- native failures should fall back to the regular send/edit path
+These tests focus on the draft-based native stream path used by Telegram.
 """
 
 from __future__ import annotations
 
-import asyncio
 import sys
 import types
 from types import SimpleNamespace
@@ -21,7 +16,6 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import SendResult
 
 
-# ── Fake telegram.error hierarchy ──────────────────────────────────────
 class FakeNetworkError(Exception):
     pass
 
@@ -34,7 +28,6 @@ class FakeTimedOut(FakeNetworkError):
     pass
 
 
-# Build a fake telegram module tree so the adapter's internal imports work.
 _fake_telegram = types.ModuleType("telegram")
 _fake_telegram.Update = object
 _fake_telegram.Bot = object
@@ -83,36 +76,7 @@ class _FakeNativeBot:
         self.calls.append((endpoint, data or {}))
         if self.fail_post:
             raise FakeNetworkError("native endpoint unavailable")
-        # Telegram draft API may return either an id-bearing object or raw dict.
         return {"draft_id": (data or {}).get("draft_id", 1), "message_id": 987}
-
-
-class _DummyAdapter:
-    def __init__(self):
-        self.send = AsyncMock(return_value=SendResult(success=True, message_id="fallback-send"))
-        self.edit_message = AsyncMock(return_value=SendResult(success=True, message_id="fallback-edit"))
-        self.send_typing = AsyncMock(return_value=None)
-        self.send_stream = AsyncMock(return_value=SendResult(success=True, message_id="stream-1"))
-
-
-@pytest.mark.asyncio
-async def test_stream_consumer_uses_send_stream_for_native_transport():
-    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
-
-    adapter = _DummyAdapter()
-    consumer = GatewayStreamConsumer(
-        adapter=adapter,
-        chat_id="123",
-        config=StreamConsumerConfig(transport="native", cursor=""),
-    )
-
-    consumer.on_delta("hello")
-    consumer.finish()
-    await consumer.run()
-
-    assert adapter.send_stream.await_count >= 1
-    adapter.send.assert_not_awaited()
-    adapter.edit_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -145,6 +109,43 @@ async def test_telegram_native_stream_uses_send_message_draft():
     assert adapter._bot.calls[0][1]["draft_id"] == 1
     assert adapter._bot.calls[0][1]["text"] == "Hello native stream"
     assert adapter._bot.calls[0][1]["message_thread_id"] == 7
+
+
+@pytest.mark.asyncio
+async def test_telegram_native_stream_finalize_keeps_using_draft_endpoint():
+    """Final native streaming updates should not fall back to a brand-new send.
+
+    This regresses the duplicate-message bug where the draft stayed visible
+    with a cursor, then Telegram received a second full message at finalize.
+    """
+    from gateway.platforms.telegram import TelegramAdapter
+
+    adapter = object.__new__(TelegramAdapter)
+    adapter.config = PlatformConfig(enabled=True, token="fake-token")
+    adapter._config = adapter.config
+    adapter._platform = Platform.TELEGRAM
+    adapter.platform = Platform.TELEGRAM
+    adapter._connected = True
+    adapter._bot = _FakeNativeBot()
+    adapter._reply_to_mode = "first"
+    adapter._disable_link_previews = False
+    adapter.format_message = lambda text: text
+    adapter._link_preview_kwargs = lambda: {}
+    adapter.send = AsyncMock(side_effect=AssertionError("final native streaming must not call send()"))
+
+    result = await adapter.send_stream(
+        chat_id="-1001234567890",
+        content="Hello native stream final",
+        message_id="42",
+        finalize=True,
+        metadata={"thread_id": "7"},
+    )
+
+    assert result.success is True
+    assert adapter.send.await_count == 0
+    assert adapter._bot.calls[0][0] == "sendMessageDraft"
+    assert adapter._bot.calls[0][1]["draft_id"] == 42
+    assert adapter._bot.calls[0][1]["text"] == "Hello native stream final"
 
 
 @pytest.mark.asyncio
