@@ -58,7 +58,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Deque, Dict, Optional
 
 from hermes_constants import get_hermes_home
-from gateway.progress_batch import telegram_progress_fits
+from gateway.progress_batch import telegram_progress_chunks, telegram_progress_fits
 
 if TYPE_CHECKING:  # pragma: no cover — type-only imports
     from gateway.platforms.base import BasePlatformAdapter
@@ -456,19 +456,28 @@ class SubagentTopicRouter:
                 f"Goal: {goal_snippet}\n"
                 "— 無新訊息 24h 後此 topic 將被自動刪除"
             )
-            result = await adapter.send(
-                chat_id=parent_chat_id,
-                content=opening,
-                metadata={"thread_id": int(thread_id)},
-            )
-            if result.success:
+            chunks = telegram_progress_chunks(adapter, [opening])
+            if not chunks:
+                chunks = [opening]
+
+            last_result = None
+            for chunk in chunks:
+                last_result = await adapter.send(
+                    chat_id=parent_chat_id,
+                    content=chunk,
+                    metadata={"thread_id": int(thread_id)},
+                )
+                if not last_result.success:
+                    break
+
+            if last_result and last_result.success:
                 with _STATE_LOCK:
                     state = _load_state(self.state_path)
                     topic = state.get("topics", {}).get(session_id)
                     if topic is not None:
                         topic["goal"] = goal
-                        if result.message_id:
-                            topic["progress_message_id"] = str(result.message_id)
+                        if last_result.message_id:
+                            topic["progress_message_id"] = str(last_result.message_id)
                         topic["progress_rendered_text"] = opening
                         _save_state(self.state_path, state)
         except Exception as e:

@@ -35,6 +35,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform
+from gateway.platforms.base import BasePlatformAdapter
 from gateway.subagent_topic_router import (
     SubagentTopicRouter,
     _clean_for_topic,
@@ -88,6 +89,12 @@ def non_telegram_source() -> SimpleNamespace:
 def adapter() -> MagicMock:
     mock = MagicMock(name="adapter")
     mock.format_message = lambda content: content
+    mock.truncate_message = (
+        lambda content, max_length, len_fn=None: BasePlatformAdapter.truncate_message(
+            content, max_length, len_fn=len_fn
+        )
+    )
+    mock.MAX_MESSAGE_LENGTH = 4096
     mock.send = AsyncMock(
         return_value=SimpleNamespace(success=True, message_id="m1")
     )
@@ -568,6 +575,46 @@ class TestRouterAsyncRoute:
         assert entry["topic_name"].startswith("SA ")
         assert entry["parent_thread_id"] == str(telegram_source.thread_id)
         assert entry["last_message_ts"] >= entry["created_ts"]
+
+    @pytest.mark.asyncio
+    async def test_lazy_creates_topic_rolls_over_opening_message(
+        self,
+        router: SubagentTopicRouter,
+        telegram_source: SimpleNamespace,
+        adapter: MagicMock,
+        patched_topic_tool,
+    ):
+        calls = 0
+
+        async def _send_side_effect(**kwargs):
+            nonlocal calls
+            calls += 1
+            return SimpleNamespace(success=True, message_id=f"m{calls}")
+
+        adapter.send.side_effect = _send_side_effect
+        adapter.MAX_MESSAGE_LENGTH = 100
+        long_goal = "goal " + ("x" * 500)
+
+        await router._async_route(
+            session_id="sid_open_roll",
+            source=telegram_source,
+            event_type="subagent.start",
+            tool_name=None,
+            preview="kick off",
+            goal=long_goal,
+            adapter=adapter,
+        )
+
+        # Pointer + multiple opening chunks.
+        assert adapter.send.await_count > 2
+        assert adapter.edit_message.await_count == 1
+        opening_calls = adapter.send.call_args_list[1:]
+        assert len(opening_calls) > 1
+        assert all(call.kwargs["metadata"]["thread_id"] == 9999 for call in opening_calls)
+        loaded = _load_state(router.state_path)
+        entry = loaded["topics"]["sid_open_roll"]
+        assert entry["goal"] == long_goal
+        assert entry["progress_message_id"] is not None
 
     @pytest.mark.asyncio
     async def test_second_event_after_create_sends_actual_event(
