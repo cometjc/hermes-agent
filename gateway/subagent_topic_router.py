@@ -10,6 +10,10 @@ Responsibilities
 * Lazy-create a forum topic on the first subagent event of a session.
 * Persist ``session_id -> (chat_id, thread_id, ...)`` mappings in
   ``~/.hermes/state/subagent_topics.json`` (atomic writes, thread-safe).
+* On each new ``subagent.start`` for an already-mapped session, rename the
+  topic to reflect the current subagent's goal.  The rename call doubles
+  as a liveness probe — if the user deleted the topic manually, Telegram
+  returns ``topic_not_found`` and we transparently create a fresh one.
 * Forward each subsequent event as a linear-history message (no edits).
 * Update ``last_message_ts`` on every successful forward so an external cron
   job can delete topics that have been idle for 24h.
@@ -222,8 +226,22 @@ class SubagentTopicRouter:
                 topics = state.setdefault("topics", {})
                 entry = topics.get(session_id)
 
+                # On ``subagent.start`` events, rename the (existing) topic to
+                # reflect the CURRENT subagent's goal.  The rename call doubles
+                # as a liveness probe: if the user deleted the topic manually,
+                # Telegram returns ``topic_not_found`` and we drop the stale
+                # entry so lazy_create fires below.
+                if entry is not None and event_type == "subagent.start":
+                    entry = await self._refresh_existing_topic(
+                        session_id=session_id,
+                        entry=entry,
+                        goal=goal,
+                    )
+                    # If the probe revealed the topic is gone, entry is now
+                    # None and we fall through to lazy_create_topic below.
+
                 if entry is None:
-                    # Lazy-create on first event.
+                    # Lazy-create on first event (or after a dead-topic probe).
                     thread_id = await self.lazy_create_topic(
                         session_id=session_id,
                         source=source,
@@ -234,7 +252,7 @@ class SubagentTopicRouter:
                         return  # creation failed; blocklisted inside helper
                     # lazy_create_topic persists the mapping via its own
                     # _load_state/_save_state cycle, so we must re-load from
-                    # disk — the in-memory `topics` dict captured on L222
+                    # disk — the in-memory `topics` dict captured above
                     # does NOT see that update.
                     state = _load_state(self.state_path)
                     entry = state.get("topics", {}).get(session_id)
@@ -450,6 +468,127 @@ class SubagentTopicRouter:
             )
 
         return thread_id
+
+    # ---- existing-topic refresh (liveness probe + rename) ---------------
+
+    async def _refresh_existing_topic(
+        self,
+        *,
+        session_id: str,
+        entry: Dict[str, Any],
+        goal: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Rename an already-mapped topic to reflect the current subagent.
+
+        Called from ``_async_route`` when we already have a persisted
+        ``entry`` for ``session_id`` and are handling a new
+        ``subagent.start`` event.  The Telegram ``edit_forum_topic`` call
+        doubles as a liveness probe:
+
+        * **Success** — update ``topic_name`` on the entry (persisted) and
+          return the refreshed entry.
+        * **``topic_not_found``** — the user deleted the topic manually.
+          Drop the stale entry from state and return ``None`` so the caller
+          falls through to :meth:`lazy_create_topic`.
+        * **Other errors** (``no_rights``, ``topic_closed``, network, …) —
+          log a warning and return the original entry unchanged so we keep
+          trying to send into the existing thread.  If the topic really is
+          broken, ``adapter.send`` will fail downstream and log its own
+          warning; we don't want a transient Telegram blip to force a
+          topic re-creation.
+
+        The caller holds ``_get_session_lock(session_id)``, so this method
+        does not need additional serialization.
+        """
+        new_name = _derive_topic_name(goal, session_id)
+        current_name = str(entry.get("topic_name") or "")
+        chat_id = str(entry.get("chat_id") or "")
+        thread_id = str(entry.get("thread_id") or "")
+
+        if not chat_id or not thread_id:
+            # Malformed entry — treat as dead so we rebuild cleanly.
+            self.logger.warning(
+                "Subagent topic refresh: entry for %s missing chat/thread "
+                "ids (%r); dropping", session_id, entry,
+            )
+            with _STATE_LOCK:
+                state = _load_state(self.state_path)
+                state.get("topics", {}).pop(session_id, None)
+                _save_state(self.state_path, state)
+            return None
+
+        # Fast path: name unchanged ⇒ skip the rename API call entirely.
+        # We trust the mapping and let downstream adapter.send surface any
+        # real deletion as a send failure (which is logged but non-fatal).
+        if new_name == current_name:
+            return entry
+
+        try:
+            from tools.telegram_topic_tool import (
+                _classify_error,
+                _load_telegram_token,
+                _run_topic_op,
+            )
+        except Exception as e:
+            self.logger.warning(
+                "Subagent topic refresh: failed to import telegram_topic_tool: %s",
+                e, exc_info=True,
+            )
+            return entry
+
+        token, token_err = _load_telegram_token()
+        if token_err or not token:
+            self.logger.warning(
+                "Subagent topic refresh: no Telegram token available: %s",
+                token_err,
+            )
+            return entry
+
+        try:
+            await _run_topic_op(
+                token,
+                "rename",
+                chat_id=chat_id,
+                thread_id=thread_id,
+                name=new_name,
+            )
+        except Exception as e:
+            code = _classify_error(e)
+            if code == "topic_not_found":
+                # User deleted the topic. Drop the stale entry so the
+                # caller creates a fresh topic.
+                self.logger.info(
+                    "Subagent topic %s/%s for session %s no longer exists "
+                    "(user deleted?) — rebuilding",
+                    chat_id, thread_id, session_id,
+                )
+                with _STATE_LOCK:
+                    state = _load_state(self.state_path)
+                    state.get("topics", {}).pop(session_id, None)
+                    _save_state(self.state_path, state)
+                return None
+            # Other failures: keep the existing mapping.  If it's really
+            # broken, adapter.send will fail and log separately; we don't
+            # want a transient rename blip to force topic re-creation.
+            self.logger.warning(
+                "Subagent topic rename failed for %s/%s (code=%s): %s",
+                chat_id, thread_id, code, e,
+            )
+            return entry
+
+        # Rename succeeded — update topic_name on the entry (persisted).
+        with _STATE_LOCK:
+            state = _load_state(self.state_path)
+            topic = state.get("topics", {}).get(session_id)
+            if topic is not None:
+                topic["topic_name"] = new_name
+                _save_state(self.state_path, state)
+                return topic
+        # State vanished between load/save — return the in-memory entry
+        # with the name applied so the caller still routes correctly.
+        entry = dict(entry)
+        entry["topic_name"] = new_name
+        return entry
 
     # ---- helpers ---------------------------------------------------------
 

@@ -981,6 +981,288 @@ class TestRouterAsyncRoute:
         _, kwargs = adapter.send.call_args
         assert "subagent.weird_event" in kwargs["content"]
 
+    # ---- existing-topic refresh (rename + liveness probe) --------------
+
+    @pytest.mark.asyncio
+    async def test_subagent_start_renames_existing_topic(
+        self,
+        router: SubagentTopicRouter,
+        telegram_source: SimpleNamespace,
+        adapter: MagicMock,
+        patched_topic_tool,
+    ):
+        """On a new subagent.start, an already-mapped topic is renamed
+        to match the fresh goal and the updated name is persisted."""
+        _save_state(
+            router.state_path,
+            {
+                "version": 1,
+                "topics": {
+                    "sid_re": {
+                        "chat_id": str(telegram_source.chat_id),
+                        "thread_id": "77",
+                        "topic_name": "SA old goal",
+                        "created_ts": 1.0,
+                        "last_message_ts": 1.0,
+                        "parent_chat_id": str(telegram_source.chat_id),
+                        "parent_thread_id": None,
+                    }
+                },
+            },
+        )
+        # rename returns success; no topic_not_found.
+        patched_topic_tool.run_op.return_value = {
+            "success": True,
+            "action": "rename",
+            "thread_id": "77",
+        }
+
+        await router._async_route(
+            session_id="sid_re",
+            source=telegram_source,
+            event_type="subagent.start",
+            tool_name=None,
+            preview="new task",
+            goal="brand new goal text",
+            adapter=adapter,
+        )
+
+        # rename called exactly once, not create.
+        patched_topic_tool.run_op.assert_awaited_once()
+        args, kwargs = patched_topic_tool.run_op.call_args
+        assert args[1] == "rename"
+        assert kwargs["chat_id"] == str(telegram_source.chat_id)
+        assert kwargs["thread_id"] == "77"
+        expected_name = _derive_topic_name("brand new goal text", "sid_re")
+        assert kwargs["name"] == expected_name
+
+        # State reflects the new name; thread_id unchanged.
+        state = _load_state(router.state_path)
+        entry = state["topics"]["sid_re"]
+        assert entry["topic_name"] == expected_name
+        assert entry["thread_id"] == "77"
+
+        # Forwarded event still went to the existing thread (no new topic).
+        adapter.send.assert_awaited_once()
+        _, send_kwargs = adapter.send.call_args
+        assert send_kwargs["metadata"]["thread_id"] == 77
+
+    @pytest.mark.asyncio
+    async def test_subagent_start_skips_rename_when_name_unchanged(
+        self,
+        router: SubagentTopicRouter,
+        telegram_source: SimpleNamespace,
+        adapter: MagicMock,
+        patched_topic_tool,
+    ):
+        """If the derived name equals the stored name, rename is skipped
+        entirely (no Telegram API call) and the event still forwards."""
+        stable_goal = "keep same goal"
+        stored_name = _derive_topic_name(stable_goal, "sid_same")
+        _save_state(
+            router.state_path,
+            {
+                "version": 1,
+                "topics": {
+                    "sid_same": {
+                        "chat_id": str(telegram_source.chat_id),
+                        "thread_id": "88",
+                        "topic_name": stored_name,
+                        "created_ts": 1.0,
+                        "last_message_ts": 1.0,
+                        "parent_chat_id": str(telegram_source.chat_id),
+                        "parent_thread_id": None,
+                    }
+                },
+            },
+        )
+
+        await router._async_route(
+            session_id="sid_same",
+            source=telegram_source,
+            event_type="subagent.start",
+            tool_name=None,
+            preview="kick off",
+            goal=stable_goal,
+            adapter=adapter,
+        )
+
+        # No Telegram API call (neither create nor rename).
+        patched_topic_tool.run_op.assert_not_called()
+
+        # Event still forwarded to the existing thread.
+        adapter.send.assert_awaited_once()
+        _, send_kwargs = adapter.send.call_args
+        assert send_kwargs["metadata"]["thread_id"] == 88
+
+        # State name untouched.
+        state = _load_state(router.state_path)
+        assert state["topics"]["sid_same"]["topic_name"] == stored_name
+
+    @pytest.mark.asyncio
+    async def test_subagent_start_rebuilds_when_topic_deleted(
+        self,
+        router: SubagentTopicRouter,
+        telegram_source: SimpleNamespace,
+        adapter: MagicMock,
+        patched_topic_tool,
+    ):
+        """If the user deleted the topic manually, rename fails with
+        ``topic_not_found`` and the router transparently re-creates."""
+        _save_state(
+            router.state_path,
+            {
+                "version": 1,
+                "topics": {
+                    "sid_dead": {
+                        "chat_id": str(telegram_source.chat_id),
+                        "thread_id": "555",
+                        "topic_name": "SA stale name",
+                        "created_ts": 1.0,
+                        "last_message_ts": 1.0,
+                        "parent_chat_id": str(telegram_source.chat_id),
+                        "parent_thread_id": None,
+                    }
+                },
+            },
+        )
+
+        # rename fails with topic_not_found; subsequent create succeeds.
+        calls: List[str] = []
+
+        async def fake_run_op(token, op, **kwargs):
+            calls.append(op)
+            if op == "rename":
+                raise Exception("Bad Request: message thread not found")
+            if op == "create":
+                return {"success": True, "thread_id": "999", "name": "SA fresh"}
+            raise AssertionError(f"unexpected op: {op}")
+
+        patched_topic_tool.run_op.side_effect = fake_run_op
+
+        await router._async_route(
+            session_id="sid_dead",
+            source=telegram_source,
+            event_type="subagent.start",
+            tool_name=None,
+            preview="new run",
+            goal="fresh goal after deletion",
+            adapter=adapter,
+        )
+
+        # We must have attempted rename first, then fallen back to create.
+        assert calls == ["rename", "create"], calls
+
+        # State now points at the new thread_id.
+        state = _load_state(router.state_path)
+        entry = state["topics"]["sid_dead"]
+        assert entry["thread_id"] == "999"
+        assert entry["topic_name"] == "SA fresh"
+
+        # adapter.send fires 3 times on the rebuild path: pointer, opening,
+        # and the forwarded event itself (same shape as first-time create).
+        assert adapter.send.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_subagent_start_keeps_entry_on_transient_rename_failure(
+        self,
+        router: SubagentTopicRouter,
+        telegram_source: SimpleNamespace,
+        adapter: MagicMock,
+        patched_topic_tool,
+    ):
+        """Non-fatal rename errors (no_rights, transient) must NOT drop
+        the mapping — we keep sending to the existing thread."""
+        _save_state(
+            router.state_path,
+            {
+                "version": 1,
+                "topics": {
+                    "sid_flaky": {
+                        "chat_id": str(telegram_source.chat_id),
+                        "thread_id": "321",
+                        "topic_name": "SA orig",
+                        "created_ts": 1.0,
+                        "last_message_ts": 1.0,
+                        "parent_chat_id": str(telegram_source.chat_id),
+                        "parent_thread_id": None,
+                    }
+                },
+            },
+        )
+
+        # Rename raises something that classifies as "unknown" (network blip).
+        async def fake_run_op(token, op, **kwargs):
+            if op == "rename":
+                raise Exception("Timed out")
+            raise AssertionError(f"unexpected op: {op}")
+
+        patched_topic_tool.run_op.side_effect = fake_run_op
+
+        await router._async_route(
+            session_id="sid_flaky",
+            source=telegram_source,
+            event_type="subagent.start",
+            tool_name=None,
+            preview="ongoing",
+            goal="a different goal that would rename",
+            adapter=adapter,
+        )
+
+        # Entry kept; name unchanged; thread_id intact.
+        state = _load_state(router.state_path)
+        entry = state["topics"]["sid_flaky"]
+        assert entry["thread_id"] == "321"
+        assert entry["topic_name"] == "SA orig"
+
+        # Event still forwarded to the existing thread.
+        adapter.send.assert_awaited_once()
+        _, send_kwargs = adapter.send.call_args
+        assert send_kwargs["metadata"]["thread_id"] == 321
+
+    @pytest.mark.asyncio
+    async def test_non_start_event_does_not_rename_existing_topic(
+        self,
+        router: SubagentTopicRouter,
+        telegram_source: SimpleNamespace,
+        adapter: MagicMock,
+        patched_topic_tool,
+    ):
+        """Only subagent.start triggers the rename/probe — tool/thinking/etc
+        events must go through as plain forwards with no Telegram API call."""
+        _save_state(
+            router.state_path,
+            {
+                "version": 1,
+                "topics": {
+                    "sid_quiet": {
+                        "chat_id": str(telegram_source.chat_id),
+                        "thread_id": "42",
+                        "topic_name": "SA stable",
+                        "created_ts": 1.0,
+                        "last_message_ts": 1.0,
+                        "parent_chat_id": str(telegram_source.chat_id),
+                        "parent_thread_id": None,
+                    }
+                },
+            },
+        )
+
+        await router._async_route(
+            session_id="sid_quiet",
+            source=telegram_source,
+            event_type="subagent.tool",
+            tool_name="terminal",
+            preview="ls",
+            goal="should be ignored for non-start events",
+            adapter=adapter,
+        )
+
+        patched_topic_tool.run_op.assert_not_called()
+        adapter.send.assert_awaited_once()
+        state = _load_state(router.state_path)
+        assert state["topics"]["sid_quiet"]["topic_name"] == "SA stable"
+
 
 # ---------------------------------------------------------------------------
 # D. Sync route() entry point
