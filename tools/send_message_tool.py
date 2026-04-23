@@ -596,6 +596,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
     try:
         from telegram import Bot
         from telegram.constants import ParseMode
+        from gateway.platforms.telegram_rate_limit import TelegramOutboundDispatcher, TelegramRateLimitedBotProxy
 
         # Auto-detect HTML tags — if present, skip MarkdownV2 and send as HTML.
         # Inspired by github.com/ashaney — PR #1568.
@@ -615,7 +616,8 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 formatted = message
             send_parse_mode = ParseMode.MARKDOWN_V2
 
-        bot = Bot(token=token)
+        dispatcher = TelegramOutboundDispatcher()
+        rate_limited_bot = TelegramRateLimitedBotProxy(Bot(token=token), dispatcher)
         int_chat_id = int(chat_id)
         media_files = media_files or []
         thread_kwargs = {}
@@ -630,7 +632,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         if formatted.strip():
             try:
                 last_msg = await _send_telegram_message_with_retry(
-                    bot,
+                    rate_limited_bot,
                     chat_id=int_chat_id, text=formatted,
                     parse_mode=send_parse_mode, **thread_kwargs
                 )
@@ -651,7 +653,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                     else:
                         plain = message
                     last_msg = await _send_telegram_message_with_retry(
-                        bot,
+                        rate_limited_bot,
                         chat_id=int_chat_id, text=plain,
                         parse_mode=None, **thread_kwargs
                     )
@@ -669,23 +671,23 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             try:
                 with open(media_path, "rb") as f:
                     if ext in _IMAGE_EXTS:
-                        last_msg = await bot.send_photo(
+                        last_msg = await rate_limited_bot.send_photo(
                             chat_id=int_chat_id, photo=f, **thread_kwargs
                         )
                     elif ext in _VIDEO_EXTS:
-                        last_msg = await bot.send_video(
+                        last_msg = await rate_limited_bot.send_video(
                             chat_id=int_chat_id, video=f, **thread_kwargs
                         )
                     elif ext in _VOICE_EXTS and is_voice:
-                        last_msg = await bot.send_voice(
+                        last_msg = await rate_limited_bot.send_voice(
                             chat_id=int_chat_id, voice=f, **thread_kwargs
                         )
                     elif ext in _AUDIO_EXTS:
-                        last_msg = await bot.send_audio(
+                        last_msg = await rate_limited_bot.send_audio(
                             chat_id=int_chat_id, audio=f, **thread_kwargs
                         )
                     else:
-                        last_msg = await bot.send_document(
+                        last_msg = await rate_limited_bot.send_document(
                             chat_id=int_chat_id, document=f, **thread_kwargs
                         )
             except Exception as e:

@@ -8,6 +8,7 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -46,6 +47,10 @@ try:
     )
     from telegram.constants import ParseMode, ChatType
     from telegram.request import HTTPXRequest
+    try:
+        from telegram.ext import AIORateLimiter
+    except ImportError:
+        AIORateLimiter = None
     TELEGRAM_AVAILABLE = True
 except ImportError:
     TELEGRAM_AVAILABLE = False
@@ -63,6 +68,7 @@ except ImportError:
     CallbackQueryHandler = Any
     TelegramMessageHandler = Any
     HTTPXRequest = Any
+    AIORateLimiter = None
     filters = None
     ParseMode = None
     ChatType = None
@@ -93,6 +99,11 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     utf16_len,
     _prefix_within_utf16_limit,
+)
+from gateway.platforms.telegram_rate_limit import (
+    TelegramOutboundDispatcher,
+    TelegramOutboundJob,
+    TelegramRateLimitedBotProxy,
 )
 from gateway.platforms.telegram_network import (
     TelegramFallbackTransport,
@@ -386,13 +397,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._clarify_pending: Dict[str, dict] = {}
         self._clarify_counter: int = 0
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-
-    def extract_media(self, content: str):
-        """Extract explicit MEDIA tags and auto-render Markdown tables as PNG files."""
-        media_files, cleaned = super().extract_media(content)
-        table_pngs, cleaned = _extract_markdown_table_blocks(cleaned)
-        media_files.extend((png_path, False) for png_path in table_pngs)
-        return media_files, cleaned
+        # Telegram outbound scheduler (used by the bot proxy and query-edit helper)
+        self._telegram_dispatcher = TelegramOutboundDispatcher()
 
     def extract_media(self, content: str):
         """Extract explicit MEDIA tags and auto-render Markdown tables as PNG files."""
@@ -737,6 +743,35 @@ class TelegramAdapter(BasePlatformAdapter):
             return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
         return {"disable_web_page_preview": True}
 
+    async def _maybe_await_result(self, value: Any) -> Any:
+        if inspect.isawaitable(value):
+            return await value
+        return value
+
+    async def _rate_limited_query_edit_message_text(self, query, **kwargs: Any) -> Any:
+        message = getattr(query, "message", None)
+        chat = getattr(message, "chat", None)
+        chat_id = getattr(chat, "id", None)
+        if chat_id is None:
+            return await query.edit_message_text(**kwargs)
+
+        message_id = getattr(message, "message_id", None)
+        coalesce_key = None
+        if message_id is not None:
+            coalesce_key = f"{chat_id}:{message_id}"
+
+        async def _run(job: TelegramOutboundJob) -> Any:
+            return await query.edit_message_text(**job.payload)
+
+        job = TelegramOutboundJob(
+            chat_id=str(chat_id),
+            kind="query.edit_message_text",
+            coalesce_key=coalesce_key,
+            payload=dict(kwargs),
+            runner=_run,
+        )
+        return await self._telegram_dispatcher.dispatch(job)
+
     async def _handle_polling_network_error(self, error: Exception) -> None:
         """Reconnect polling after a transient network interruption.
 
@@ -783,10 +818,12 @@ class TelegramAdapter(BasePlatformAdapter):
             pass
 
         try:
-            await self._app.updater.start_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=False,
-                error_callback=self._polling_error_callback_ref,
+            await self._maybe_await_result(
+                self._app.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=False,
+                    error_callback=self._polling_error_callback_ref,
+                )
             )
             logger.info(
                 "[%s] Telegram polling resumed after network error (attempt %d)",
@@ -830,12 +867,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 pass
             await asyncio.sleep(RETRY_DELAY)
             try:
-                await self._app.updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=False,
-                    error_callback=self._polling_error_callback_ref,
+                await self._maybe_await_result(
+                    self._app.updater.start_polling(
+                        allowed_updates=Update.ALL_TYPES,
+                        drop_pending_updates=False,
+                        error_callback=self._polling_error_callback_ref,
+                    )
                 )
-                logger.info("[%s] Telegram polling resumed after conflict retry %d", self.name, self._polling_conflict_count)
+                logger.info(
+                    "[%s] Telegram polling resumed after conflict retry %d",
+                    self.name,
+                    self._polling_conflict_count,
+                )
                 self._polling_conflict_count = 0  # reset on success
                 return
             except Exception as retry_err:
@@ -1146,7 +1189,24 @@ class TelegramAdapter(BasePlatformAdapter):
                 request = HTTPXRequest(**request_kwargs)
                 get_updates_request = HTTPXRequest(**request_kwargs)
 
-            builder = builder.request(request).get_updates_request(get_updates_request)
+            builder.request(request)
+            builder.get_updates_request(get_updates_request)
+            if AIORateLimiter is not None:
+                try:
+                    rate_limiter = AIORateLimiter(
+                        overall_max_rate=30,
+                        overall_time_period=1,
+                        group_max_rate=20,
+                        group_time_period=60,
+                    )
+                except Exception as rate_limiter_err:
+                    logger.warning(
+                        "[%s] PTB AIORateLimiter unavailable, continuing without it: %s",
+                        self.name,
+                        rate_limiter_err,
+                    )
+                else:
+                    builder.rate_limiter(rate_limiter)
             self._app = builder.build()
             self._bot = self._app.bot
             
@@ -1178,7 +1238,7 @@ class TelegramAdapter(BasePlatformAdapter):
             _max_connect = 8
             for _attempt in range(_max_connect):
                 try:
-                    await self._app.initialize()
+                    await self._maybe_await_result(self._app.initialize())
                     break
                 except (NetworkError, TimedOut, OSError) as init_err:
                     if _attempt < _max_connect - 1:
@@ -1190,7 +1250,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         await asyncio.sleep(wait)
                     else:
                         raise
-            await self._app.start()
+            await self._maybe_await_result(self._app.start())
+            self._bot = TelegramRateLimitedBotProxy(self._bot, self._telegram_dispatcher)
 
             # Decide between webhook and polling mode
             webhook_url = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
@@ -1225,14 +1286,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 from urllib.parse import urlparse
                 webhook_path = urlparse(webhook_url).path or "/telegram"
 
-                await self._app.updater.start_webhook(
-                    listen="0.0.0.0",
-                    port=webhook_port,
-                    url_path=webhook_path,
-                    webhook_url=webhook_url,
-                    secret_token=webhook_secret,
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True,
+                await self._maybe_await_result(
+                    self._app.updater.start_webhook(
+                        listen="0.0.0.0",
+                        port=webhook_port,
+                        url_path=webhook_path,
+                        webhook_url=webhook_url,
+                        secret_token=webhook_secret,
+                        allowed_updates=Update.ALL_TYPES,
+                        drop_pending_updates=True,
+                    )
                 )
                 self._webhook_mode = True
                 logger.info(
@@ -1245,7 +1308,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # previous webhook registration and silently stop receiving updates.
                 delete_webhook = getattr(self._bot, "delete_webhook", None)
                 if callable(delete_webhook):
-                    await delete_webhook(drop_pending_updates=False)
+                    await self._maybe_await_result(delete_webhook(drop_pending_updates=False))
 
                 loop = asyncio.get_running_loop()
 
@@ -1263,10 +1326,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 # Store reference for retry use in _handle_polling_conflict
                 self._polling_error_callback_ref = _polling_error_callback
 
-                await self._app.updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True,
-                    error_callback=_polling_error_callback,
+                await self._maybe_await_result(
+                    self._app.updater.start_polling(
+                        allowed_updates=Update.ALL_TYPES,
+                        drop_pending_updates=True,
+                        error_callback=_polling_error_callback,
+                    )
                 )
             
             # Register bot commands so Telegram shows a hint menu when users type /
@@ -1279,9 +1344,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 # payload size limit.  Skill descriptions are truncated to 40
                 # chars in telegram_menu_commands() to fit 100 commands safely.
                 menu_commands, hidden_count = telegram_menu_commands(max_commands=100)
-                await self._bot.set_my_commands([
-                    BotCommand(name, desc) for name, desc in menu_commands
-                ])
+                await self._maybe_await_result(
+                    self._bot.set_my_commands([
+                        BotCommand(name, desc) for name, desc in menu_commands
+                    ])
+                )
                 if hidden_count:
                     logger.info(
                         "[%s] Telegram menu: %d commands registered, %d hidden (over 100 limit). Use /commands for full list.",
@@ -1962,7 +2029,7 @@ class TelegramAdapter(BasePlatformAdapter):
             shown = len(models)
             extra = f"\n_{total - shown} more available — type `/model <name>` directly_" if total > shown else ""
 
-            await query.edit_message_text(
+            await self._rate_limited_query_edit_message_text(query,
                 text=(
                     f"⚙ *Model Configuration*\n\n"
                     f"Provider: *{pname}*{page_info}\n"
@@ -1996,7 +2063,7 @@ class TelegramAdapter(BasePlatformAdapter):
             shown = len(models)
             extra = f"\n_{total - shown} more available — type `/model <name>` directly_" if total > shown else ""
 
-            await query.edit_message_text(
+            await self._rate_limited_query_edit_message_text(query,
                 text=(
                     f"⚙ *Model Configuration*\n\n"
                     f"Provider: *{pname}*{page_info}\n"
@@ -2036,7 +2103,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
             # Edit message to show confirmation, remove buttons
             try:
-                await query.edit_message_text(
+                await self._rate_limited_query_edit_message_text(query,
                     text=result_text,
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=None,
@@ -2044,7 +2111,7 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 # Markdown parse failure — retry as plain text
                 try:
-                    await query.edit_message_text(
+                    await self._rate_limited_query_edit_message_text(query,
                         text=result_text,
                         parse_mode=None,
                         reply_markup=None,
@@ -2077,7 +2144,7 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 provider_label = state["current_provider"]
 
-            await query.edit_message_text(
+            await self._rate_limited_query_edit_message_text(query,
                 text=(
                     f"⚙ *Model Configuration*\n\n"
                     f"Current model: `{state['current_model'] or 'unknown'}`\n"
@@ -2092,7 +2159,7 @@ class TelegramAdapter(BasePlatformAdapter):
         elif data == "mx":
             # --- Cancel ---
             self._model_picker_state.pop(chat_id, None)
-            await query.edit_message_text(
+            await self._rate_limited_query_edit_message_text(query,
                 text="Model selection cancelled.",
                 reply_markup=None,
             )
@@ -2154,7 +2221,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 # Edit message to show decision, remove buttons
                 try:
-                    await query.edit_message_text(
+                    await self._rate_limited_query_edit_message_text(query,
                         text=f"{label} by {user_display}",
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=None,
@@ -2186,7 +2253,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Edit the message to show the choice and remove buttons
         label = "Yes" if answer == "y" else "No"
         try:
-            await query.edit_message_text(
+            await self._rate_limited_query_edit_message_text(query,
                 text=f"⚕ Update prompt answered: *{label}*",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=None,
