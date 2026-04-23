@@ -37,6 +37,12 @@ class _ReplyKeyboardRemove:
         self.kwargs = kwargs
 
 
+class _FakeRetryAfter(Exception):
+    def __init__(self, retry_after):
+        super().__init__(f"Flood control; retry after {retry_after}")
+        self.retry_after = retry_after
+
+
 def _ensure_telegram_mock():
     """Wire up the minimal mocks required to import TelegramAdapter."""
     mod = MagicMock()
@@ -72,6 +78,37 @@ def _make_adapter(extra=None):
     adapter._bot = AsyncMock()
     adapter._app = MagicMock()
     return adapter
+
+
+@pytest.mark.asyncio
+async def test_send_clarify_prompt_retries_retry_after():
+    """Telegram clarify prompts should retry flood-control errors instead of failing."""
+    adapter = _make_adapter()
+    attempts = [0]
+
+    async def mock_send_message(**kwargs):
+        attempts[0] += 1
+        if attempts[0] == 1:
+            raise _FakeRetryAfter(0.01)
+        return SimpleNamespace(message_id=654)
+
+    adapter._bot.send_message = AsyncMock(side_effect=mock_send_message)
+
+    message_id = await adapter._send_clarify_prompt(
+        chat_id="12345",
+        thread_id="99",
+        reply_to_message_id="456",
+        question="Pick one?",
+        choices=["Alpha", "Beta"],
+    )
+
+    assert message_id == "654"
+    assert attempts[0] == 2
+    prompt_kwargs = adapter._bot.send_message.await_args_list[-1].kwargs
+    assert prompt_kwargs["chat_id"] == 12345
+    assert prompt_kwargs["message_thread_id"] == 99
+    assert prompt_kwargs["reply_to_message_id"] == 456
+    assert isinstance(prompt_kwargs["reply_markup"], _ReplyKeyboardMarkup)
 
 
 @pytest.mark.asyncio

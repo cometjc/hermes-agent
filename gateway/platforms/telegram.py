@@ -418,6 +418,42 @@ class TelegramAdapter(BasePlatformAdapter):
             selective=True,
         )
 
+    async def _send_message_with_retry(
+        self,
+        *,
+        context: str,
+        **kwargs: Any,
+    ) -> Any:
+        """Send a Telegram message with the same retry policy as `send()`.
+
+        Clarify prompts bypass `send()` because they need reply keyboards and
+        thread-specific reply metadata. Reusing the same flood-control retry
+        policy keeps clarify prompts from failing fast when Telegram returns
+        `retry_after`.
+        """
+        if not self._bot:
+            raise RuntimeError("Not connected")
+
+        for attempt in range(3):
+            try:
+                return await self._bot.send_message(**kwargs)
+            except Exception as send_err:
+                retry_after = getattr(send_err, "retry_after", None)
+                if retry_after is not None or "retry after" in str(send_err).lower():
+                    if attempt < 2:
+                        wait = float(retry_after) if retry_after is not None else 1.0
+                        logger.warning(
+                            "[%s] Telegram flood control on %s (attempt %d/3), retrying in %.1fs: %s",
+                            self.name,
+                            context,
+                            attempt + 1,
+                            wait,
+                            send_err,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                raise
+
     async def _send_clarify_prompt(
         self,
         *,
@@ -450,7 +486,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if keyboard is not None:
             kwargs["reply_markup"] = keyboard
 
-        msg = await self._bot.send_message(**kwargs)
+        msg = await self._send_message_with_retry(context="clarify prompt", **kwargs)
         return str(getattr(msg, "message_id", "")) or None
 
     async def _clear_clarify_keyboard(
