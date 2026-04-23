@@ -87,6 +87,7 @@ def non_telegram_source() -> SimpleNamespace:
 @pytest.fixture
 def adapter() -> MagicMock:
     mock = MagicMock(name="adapter")
+    mock.format_message = lambda content: content
     mock.send = AsyncMock(
         return_value=SimpleNamespace(success=True, message_id="m1")
     )
@@ -687,6 +688,59 @@ class TestRouterAsyncRoute:
         loaded = _load_state(router.state_path)
         new_ts = loaded["topics"]["sid_ts"]["last_message_ts"]
         assert new_ts > old_ts
+
+    @pytest.mark.asyncio
+    async def test_rolls_over_before_telegram_limit(
+        self,
+        router: SubagentTopicRouter,
+        telegram_source: SimpleNamespace,
+        adapter: MagicMock,
+        patched_topic_tool,
+    ):
+        old_ts = time.time() - 10_000
+        _save_state(
+            router.state_path,
+            {
+                "version": 1,
+                "topics": {
+                    "sid_roll": {
+                        "chat_id": str(telegram_source.chat_id),
+                        "thread_id": "77",
+                        "topic_name": "SA roll",
+                        "created_ts": old_ts,
+                        "last_message_ts": old_ts,
+                        "parent_chat_id": str(telegram_source.chat_id),
+                        "parent_thread_id": None,
+                        "progress_message_id": "old-msg",
+                        "progress_rendered_text": "old text",
+                    }
+                },
+            },
+        )
+        adapter.MAX_MESSAGE_LENGTH = 600
+
+        long_preview = "x" * 700
+        await router._async_route(
+            session_id="sid_roll",
+            source=telegram_source,
+            event_type="subagent.progress",
+            tool_name=None,
+            preview=long_preview,
+            goal=None,
+            adapter=adapter,
+        )
+
+        adapter.edit_message.assert_not_awaited()
+        adapter.send.assert_awaited_once()
+        send_kwargs = adapter.send.call_args.kwargs
+        assert send_kwargs["chat_id"] == str(telegram_source.chat_id)
+        assert send_kwargs["metadata"]["thread_id"] == 77
+        assert long_preview in send_kwargs["content"]
+
+        loaded = _load_state(router.state_path)
+        entry = loaded["topics"]["sid_roll"]
+        assert entry["progress_message_id"] == "m1"
+        assert entry["last_message_ts"] > old_ts
 
     @pytest.mark.asyncio
     async def test_lazy_create_failure_blocklists(
