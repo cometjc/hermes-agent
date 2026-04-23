@@ -2102,12 +2102,12 @@ def _(rid, params: dict) -> dict:
 
 @method("session.steer")
 def _(rid, params: dict) -> dict:
-    """Inject a user message into the next tool result without interrupting.
+    """Inject user guidance into the active turn without interrupting.
 
-    Mirrors AIAgent.steer(). Safe to call while a turn is running — the text
-    lands on the last tool result of the next tool batch and the model sees
-    it on its next iteration. No interrupt, no new user turn, no role
-    alternation violation.
+    Mirrors AIAgent.steer(), but only while the session has an active turn.
+    The text lands on the last tool result of the next tool batch and the
+    model sees it on its next iteration. No interrupt, no new user turn, no
+    role alternation violation.
     """
     text = (params.get("text") or "").strip()
     if not text:
@@ -2115,6 +2115,8 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if not session.get("running"):
+        return _ok(rid, {"status": "rejected", "text": text})
     agent = session.get("agent")
     if agent is None or not hasattr(agent, "steer"):
         return _err(rid, 4010, "agent does not support steer")

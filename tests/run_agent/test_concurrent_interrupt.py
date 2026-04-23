@@ -77,10 +77,9 @@ def _make_agent(monkeypatch):
     stub._execute_tool_calls_concurrent = _ra.AIAgent._execute_tool_calls_concurrent.__get__(stub)
     stub.interrupt = _ra.AIAgent.interrupt.__get__(stub)
     stub.clear_interrupt = _ra.AIAgent.clear_interrupt.__get__(stub)
-    # /steer injection (added in PR #12116) fires after every concurrent
-    # tool batch. Stub it as a no-op — this test exercises interrupt
-    # fanout, not steer injection.
-    stub._apply_pending_steer_to_tool_results = lambda *a, **kw: None
+    # /steer is turn-bound pending input. Stub the flush helper as a no-op —
+    # this test exercises interrupt fanout, not steer persistence.
+    stub._append_pending_steer_as_user_message = lambda *a, **kw: False
     stub._invoke_tool = MagicMock(side_effect=lambda *a, **kw: '{"ok": true}')
     return stub
 

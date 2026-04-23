@@ -392,7 +392,7 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
-    help: 'inject a message after the next tool call (no interrupt)',
+    help: 'inject guidance into the active turn after the next tool call (no interrupt)',
     name: 'steer',
     run: (arg, ctx) => {
       const payload = arg?.trim() ?? ''
@@ -401,15 +401,8 @@ export const coreCommands: SlashCommand[] = [
         return ctx.transcript.sys('usage: /steer <prompt>')
       }
 
-      // If the agent isn't running, fall back to the queue so the user's
-      // message isn't lost — identical semantics to the gateway handler.
-      if (!ctx.ui.busy || !ctx.sid) {
-        ctx.composer.enqueue(payload)
-        ctx.transcript.sys(
-          `no active turn — queued for next: "${payload.slice(0, 50)}${payload.length > 50 ? '…' : ''}"`
-        )
-
-        return
+      if (!ctx.sid) {
+        return ctx.transcript.sys('session not ready yet')
       }
 
       ctx.gateway
@@ -421,7 +414,7 @@ export const coreCommands: SlashCommand[] = [
                 `⏩ steer queued — arrives after next tool call: "${payload.slice(0, 50)}${payload.length > 50 ? '…' : ''}"`
               )
             } else {
-              ctx.transcript.sys('steer rejected')
+              ctx.transcript.sys('steer rejected — no active turn')
             }
           })
         )

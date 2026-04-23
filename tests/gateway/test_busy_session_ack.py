@@ -117,6 +117,7 @@ class TestTelegramBusyRouting:
         running_agent.steer.assert_called_once_with("please inspect the logs")
         running_agent.interrupt.assert_not_called()
         assert sk not in adapter._pending_messages
+        adapter.remember_pending_steer_reaction.assert_called_once_with(sk, event)
         adapter._set_reaction.assert_awaited_once_with(
             "123",
             "msg1",
