@@ -314,6 +314,48 @@ class TestDelegateTask(unittest.TestCase):
         self.assertEqual(args[0], "subagent.thinking")
         self.assertEqual(args[2], "actual reasoning text")
 
+    def test_child_write_file_complete_relays_diff_preview(self):
+        parent = _make_mock_parent(depth=0)
+        parent.tool_progress_callback = MagicMock()
+
+        with patch("run_agent.AIAgent") as MockAgent, \
+             patch("agent.display.capture_local_edit_snapshot", return_value="snap"), \
+             patch("agent.display.extract_edit_diff", return_value="--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n"), \
+             patch("agent.display.build_tool_preview", return_value="gateway/run.py"):
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="Show write diff",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        call_kwargs = MockAgent.call_args.kwargs
+        self.assertTrue(callable(call_kwargs["tool_start_callback"]))
+        self.assertTrue(callable(call_kwargs["tool_complete_callback"]))
+
+        call_kwargs["tool_start_callback"]("c1", "write_file", {"path": "gateway/run.py"})
+        call_kwargs["tool_complete_callback"](
+            "c1",
+            "write_file",
+            {"path": "gateway/run.py"},
+            '{"success": true}',
+        )
+
+        calls = parent.tool_progress_callback.call_args_list
+        self.assertTrue(any(c.args[0] == "subagent.tool" for c in calls))
+        last = calls[-1]
+        self.assertEqual(last.args[0], "subagent.tool")
+        self.assertEqual(last.args[1], "write_file")
+        self.assertEqual(last.args[2], "gateway/run.py")
+        self.assertEqual(last.args[3], {"diff": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n"})
+
 
 class TestToolNamePreservation(unittest.TestCase):
     """Verify _last_resolved_tool_names is restored after subagent runs."""

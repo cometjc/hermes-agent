@@ -340,6 +340,38 @@ class TestFormatEvent:
         assert m is not None
         assert len(m.group(1)) == 60
 
+    def test_patch_tool_renders_fenced_patch_block(self, monkeypatch: pytest.MonkeyPatch):
+        import agent.display as display
+
+        monkeypatch.setattr(display, "get_tool_emoji", lambda name, default="⚙️": "✍️")
+        out = _format_event(
+            "subagent.tool",
+            "patch",
+            "gateway/run.py",
+            args={"patch": "*** Begin Patch\n*** Update File: gateway/run.py\n+hello\n*** End Patch\n"},
+        )
+
+        assert out.startswith('✍️ patch: "gateway/run.py"')
+        assert "```patch" in out
+        assert "*** Update File: gateway/run.py" in out
+        assert out.endswith("```")
+
+    def test_write_file_tool_renders_diff_block(self, monkeypatch: pytest.MonkeyPatch):
+        import agent.display as display
+
+        monkeypatch.setattr(display, "get_tool_emoji", lambda name, default="⚙️": "✍️")
+        out = _format_event(
+            "subagent.tool",
+            "write_file",
+            "gateway/run.py",
+            args={"diff": "--- a/gateway/run.py\n+++ b/gateway/run.py\n@@ -1 +1 @@\n-old\n+new\n"},
+        )
+
+        assert out.startswith('✍️ write_file: "gateway/run.py"')
+        assert "```patch" in out
+        assert "--- a/gateway/run.py" in out
+        assert "+++ b/gateway/run.py" in out
+
     def test_progress(self):
         assert _format_event("subagent.progress", None, "step 2/5") == "⏳ step 2/5"
 
@@ -1400,6 +1432,52 @@ class TestRouterAsyncRoute:
         state = _load_state(router.state_path)
         assert state["topics"]["sid_quiet"]["topic_name"] == "SA stable"
 
+    @pytest.mark.asyncio
+    async def test_patch_tool_event_forwards_fenced_patch_block(
+        self,
+        router: SubagentTopicRouter,
+        telegram_source: SimpleNamespace,
+        adapter: MagicMock,
+        patched_topic_tool,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        import agent.display as display
+
+        monkeypatch.setattr(display, "get_tool_emoji", lambda name, default="⚙️": "✍️")
+        _save_state(
+            router.state_path,
+            {
+                "version": 1,
+                "topics": {
+                    "sid_patch": {
+                        "chat_id": str(telegram_source.chat_id),
+                        "thread_id": "42",
+                        "topic_name": "SA patch",
+                        "created_ts": 1.0,
+                        "last_message_ts": 1.0,
+                        "parent_chat_id": str(telegram_source.chat_id),
+                        "parent_thread_id": None,
+                    }
+                },
+            },
+        )
+
+        await router._async_route(
+            session_id="sid_patch",
+            source=telegram_source,
+            event_type="subagent.tool",
+            tool_name="patch",
+            preview="gateway/run.py",
+            args={"patch": "*** Begin Patch\n*** Update File: gateway/run.py\n+hello\n*** End Patch\n"},
+            goal=None,
+            adapter=adapter,
+        )
+
+        _, send_kwargs = adapter.send.call_args
+        assert '✍️ patch: "gateway/run.py"' in send_kwargs["content"]
+        assert "```patch" in send_kwargs["content"]
+        assert "*** Update File: gateway/run.py" in send_kwargs["content"]
+
 
 # ---------------------------------------------------------------------------
 # D. Sync route() entry point
@@ -1414,47 +1492,26 @@ class TestRouterSyncEntry:
         adapter: MagicMock,
         patched_topic_tool,
     ):
-        """``route()`` is callable from a sync thread and actually schedules.
-
-        We run the asyncio loop on a background thread, submit the work via
-        ``router.route()`` (sync), and wait for the scheduled future so the
-        test is deterministic (no ``sleep``-based flakiness).
-        """
-        import threading
-
+        """``route()`` should hand work off to ``run_coroutine_threadsafe``."""
         loop = asyncio.new_event_loop()
-        ready = threading.Event()
-
-        def _run_loop():
-            asyncio.set_event_loop(loop)
-            ready.set()
-            loop.run_forever()
-
-        t = threading.Thread(target=_run_loop, daemon=True)
-        t.start()
         try:
-            assert ready.wait(timeout=2.0)
-            router.route(
-                session_id="sid_sync",
-                source=telegram_source,
-                event_type="subagent.start",
-                tool_name=None,
-                preview="sync hi",
-                goal="Sync goal is fine",
-                adapter=adapter,
-                loop=loop,
-            )
-            # Wait for the scheduled coroutine to complete by polling
-            # until adapter.send has been awaited at least once.
-            deadline = time.time() + 3.0
-            while time.time() < deadline and adapter.send.await_count == 0:
-                time.sleep(0.02)
+            with patch("gateway.subagent_topic_router.asyncio.run_coroutine_threadsafe") as mock_schedule:
+                router.route(
+                    session_id="sid_sync",
+                    source=telegram_source,
+                    event_type="subagent.start",
+                    tool_name=None,
+                    preview="sync hi",
+                    goal="Sync goal is fine",
+                    adapter=adapter,
+                    loop=loop,
+                )
+                scheduled_coro = mock_schedule.call_args.args[0]
         finally:
-            loop.call_soon_threadsafe(loop.stop)
-            t.join(timeout=2.0)
             loop.close()
 
-        adapter.send.assert_awaited()
+        scheduled_coro.close()
+        mock_schedule.assert_called_once()
 
     @pytest.mark.filterwarnings("ignore::RuntimeWarning")
     def test_route_sync_swallows_exceptions(

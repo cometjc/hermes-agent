@@ -92,6 +92,7 @@ _MARKDOWN_STRIP = str.maketrans({c: None for c in "*`#_[]"})
 _RATE_WINDOW = 5
 _RATE_THRESHOLD_SECONDS = 3.0
 _RATE_BACKOFF_SECONDS = 0.5
+_PATCH_PREVIEW_MAX_CHARS = 1200
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +168,7 @@ class SubagentTopicRouter:
         event_type: str,
         tool_name: Optional[str] = None,
         preview: Optional[str] = None,
+        args: Optional[Dict[str, Any]] = None,
         goal: Optional[str] = None,
         adapter: "BasePlatformAdapter",
         loop: asyncio.AbstractEventLoop,
@@ -185,6 +187,7 @@ class SubagentTopicRouter:
                 event_type=event_type,
                 tool_name=tool_name,
                 preview=preview,
+                args=args,
                 goal=goal,
                 adapter=adapter,
             )
@@ -205,6 +208,7 @@ class SubagentTopicRouter:
         event_type: str,
         tool_name: Optional[str],
         preview: Optional[str],
+        args: Optional[Dict[str, Any]] = None,
         goal: Optional[str],
         adapter: "BasePlatformAdapter",
     ) -> None:
@@ -266,7 +270,7 @@ class SubagentTopicRouter:
             # Backpressure: throttle if the session is emitting fast.
             await self._apply_backpressure(session_id)
 
-            msg = _format_event(event_type, tool_name, preview)
+            msg = _format_event(event_type, tool_name, preview, args=args)
             if not msg:
                 return
 
@@ -830,6 +834,8 @@ def _format_event(
     event_type: str,
     tool_name: Optional[str],
     preview: Optional[str],
+    *,
+    args: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Render a subagent event as a single-line Telegram message."""
     preview = preview or ""
@@ -852,6 +858,9 @@ def _format_event(
         if preview:
             snippet = preview[:60]
             line = f'{line}: "{snippet}"'
+        patch_block = _extract_patch_preview(tool_name, args)
+        if patch_block:
+            return f"{line}\n{patch_block}".rstrip()
         return line
 
     if event_type == "subagent.progress":
@@ -864,6 +873,26 @@ def _format_event(
     # Unknown event — still forward so debugging is easier.
     tail = preview or tool_name or ""
     return f"· {event_type}: {tail}".rstrip()
+
+
+def _extract_patch_preview(
+    tool_name: Optional[str],
+    args: Optional[Dict[str, Any]],
+) -> str | None:
+    """Return a fenced patch block for edit-tool events when available."""
+    if tool_name not in {"patch", "write_file"} or not isinstance(args, dict):
+        return None
+    patch_text = args.get("diff")
+    if not isinstance(patch_text, str):
+        patch_text = args.get("patch")
+    if not isinstance(patch_text, str):
+        return None
+    patch_text = patch_text.strip()
+    if not patch_text:
+        return None
+    if len(patch_text) > _PATCH_PREVIEW_MAX_CHARS:
+        patch_text = patch_text[: _PATCH_PREVIEW_MAX_CHARS - 1].rstrip() + "…"
+    return f"```patch\n{patch_text}\n```"
 
 
 # ---------------------------------------------------------------------------

@@ -9796,6 +9796,7 @@ class GatewayRunner:
                         event_type=event_type,
                         tool_name=tool_name,
                         preview=preview,
+                        args=args,
                         goal=kwargs.get("goal"),
                         adapter=_subagent_adapter,
                         loop=_subagent_router_loop,

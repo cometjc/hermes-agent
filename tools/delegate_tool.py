@@ -877,6 +877,7 @@ def _build_child_progress_callback(
             _batch.clear()
 
     _callback._flush = _flush
+    _callback._relay_direct = _relay
     return _callback
 
 
@@ -1015,7 +1016,16 @@ def _build_child_agent(
     # max_iterations.  The user controls the per-subagent cap in config.yaml.
 
     child_reasoning_cb = None
+    child_tool_start_cb = None
+    child_tool_complete_cb = None
     if child_progress_cb:
+        from agent.display import (
+            build_tool_preview,
+            capture_local_edit_snapshot,
+            extract_edit_diff,
+        )
+
+        _edit_snapshots: Dict[str, Any] = {}
 
         def _child_reasoning(text: str) -> None:
             if not text:
@@ -1030,6 +1040,50 @@ def _build_child_agent(
                 logger.debug("Child reasoning callback relay failed: %s", e)
 
         child_reasoning_cb = _child_reasoning
+
+        def _child_tool_start(
+            tool_call_id: str,
+            function_name: str,
+            function_args: dict,
+        ) -> None:
+            if function_name != "write_file" or not tool_call_id:
+                return
+            snapshot = capture_local_edit_snapshot(function_name, function_args)
+            if snapshot is not None:
+                _edit_snapshots[tool_call_id] = snapshot
+
+        def _child_tool_complete(
+            tool_call_id: str,
+            function_name: str,
+            function_args: dict,
+            function_result: str,
+        ) -> None:
+            if function_name != "write_file":
+                return
+            snapshot = _edit_snapshots.pop(tool_call_id, None)
+            diff = extract_edit_diff(
+                function_name,
+                function_result,
+                function_args=function_args,
+                snapshot=snapshot,
+            )
+            if not diff:
+                return
+            try:
+                relay_direct = getattr(child_progress_cb, "_relay_direct", None)
+                if relay_direct is None:
+                    return
+                relay_direct(
+                    "subagent.tool",
+                    function_name,
+                    build_tool_preview(function_name, function_args) or "",
+                    {"diff": diff},
+                )
+            except Exception as e:
+                logger.debug("Child tool complete callback relay failed: %s", e)
+
+        child_tool_start_cb = _child_tool_start
+        child_tool_complete_cb = _child_tool_complete
 
     # Resolve effective credentials: config override > parent inherit
     effective_model = model or parent_agent.model
@@ -1100,6 +1154,8 @@ def _build_child_agent(
         providers_order=parent_agent.providers_order,
         provider_sort=parent_agent.provider_sort,
         tool_progress_callback=child_progress_cb,
+        tool_start_callback=child_tool_start_cb,
+        tool_complete_callback=child_tool_complete_cb,
         iteration_budget=None,  # fresh budget per subagent
     )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
