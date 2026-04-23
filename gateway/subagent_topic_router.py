@@ -14,7 +14,7 @@ Responsibilities
   topic to reflect the current subagent's goal.  The rename call doubles
   as a liveness probe — if the user deleted the topic manually, Telegram
   returns ``topic_not_found`` and we transparently create a fresh one.
-* Forward each subsequent event as a linear-history message (no edits).
+* Keep subagent progress in a single Telegram message, editing it in place.
 * Update ``last_message_ts`` on every successful forward so an external cron
   job can delete topics that have been idle for 24h.
 * Soft-fail gracefully: any exception is swallowed with a warning so the
@@ -268,27 +268,14 @@ class SubagentTopicRouter:
             if not msg:
                 return
 
-            try:
-                await adapter.send(
-                    chat_id=str(entry["chat_id"]),
-                    content=msg,
-                    metadata={"thread_id": int(entry["thread_id"])},
-                )
-            except Exception as e:
-                self.logger.warning(
-                    "Subagent topic send failed for session %s: %s",
-                    session_id, e, exc_info=True,
-                )
+            if not await self._deliver_progress_update(
+                session_id=session_id,
+                entry=entry,
+                event_text=msg,
+                event_type=event_type,
+                adapter=adapter,
+            ):
                 return
-
-            # Update last_message_ts on successful send.
-            now = time.time()
-            with _STATE_LOCK:
-                state2 = _load_state(self.state_path)
-                topic2 = state2.get("topics", {}).get(session_id)
-                if topic2 is not None:
-                    topic2["last_message_ts"] = now
-                    _save_state(self.state_path, state2)
         except Exception as e:
             self.logger.warning(
                 "Subagent topic route failed: %s", e, exc_info=True
@@ -467,11 +454,21 @@ class SubagentTopicRouter:
                 f"Goal: {goal_snippet}\n"
                 "— 無新訊息 24h 後此 topic 將被自動刪除"
             )
-            await adapter.send(
+            result = await adapter.send(
                 chat_id=parent_chat_id,
                 content=opening,
                 metadata={"thread_id": int(thread_id)},
             )
+            if result.success:
+                with _STATE_LOCK:
+                    state = _load_state(self.state_path)
+                    topic = state.get("topics", {}).get(session_id)
+                    if topic is not None:
+                        topic["goal"] = goal
+                        if result.message_id:
+                            topic["progress_message_id"] = str(result.message_id)
+                        topic["progress_rendered_text"] = opening
+                        _save_state(self.state_path, state)
         except Exception as e:
             self.logger.warning(
                 "Subagent topic opening message failed for chat %s thread %s: %s",
@@ -532,6 +529,13 @@ class SubagentTopicRouter:
         # We trust the mapping and let downstream adapter.send surface any
         # real deletion as a send failure (which is logged but non-fatal).
         if new_name == current_name:
+            if goal is not None:
+                with _STATE_LOCK:
+                    state = _load_state(self.state_path)
+                    topic = state.get("topics", {}).get(session_id)
+                    if topic is not None:
+                        topic["goal"] = goal
+                        _save_state(self.state_path, state)
             return entry
 
         try:
@@ -593,12 +597,16 @@ class SubagentTopicRouter:
             topic = state.get("topics", {}).get(session_id)
             if topic is not None:
                 topic["topic_name"] = new_name
+                if goal is not None:
+                    topic["goal"] = goal
                 _save_state(self.state_path, state)
                 return topic
         # State vanished between load/save — return the in-memory entry
         # with the name applied so the caller still routes correctly.
         entry = dict(entry)
         entry["topic_name"] = new_name
+        if goal is not None:
+            entry["goal"] = goal
         return entry
 
     # ---- helpers ---------------------------------------------------------
@@ -628,10 +636,108 @@ class SubagentTopicRouter:
                 # has no other exceptions worth swallowing here.
                 await asyncio.sleep(_RATE_BACKOFF_SECONDS)
 
+    def _render_progress_message(
+        self,
+        *,
+        session_id: str,
+        entry: Dict[str, Any],
+        event_text: str,
+        include_goal: bool = False,
+    ) -> str:
+        """Render the single edited progress message for a subagent session."""
+        topic_name = str(entry.get("topic_name") or f"Session {session_id[:8]}").strip()
+        goal = str(entry.get("goal") or "").strip()
+        if include_goal and goal:
+            goal = _summarize(goal, max_chars=180)
+        else:
+            goal = ""
+        lines = [f"🔀 {topic_name}"]
+        if goal:
+            lines.append(f"Goal: {goal}")
+        lines.extend(("", event_text))
+        return "\n".join(lines)
 
-# ---------------------------------------------------------------------------
-# Pure helpers: topic name + event formatting
-# ---------------------------------------------------------------------------
+    async def _deliver_progress_update(
+        self,
+        *,
+        session_id: str,
+        entry: Dict[str, Any],
+        event_text: str,
+        event_type: str,
+        adapter: "BasePlatformAdapter",
+    ) -> bool:
+        """Edit or send the single subagent progress message in place."""
+        content = self._render_progress_message(
+            session_id=session_id,
+            entry=entry,
+            event_text=event_text,
+            include_goal=(event_type == "subagent.start"),
+        )
+        chat_id = str(entry.get("chat_id") or "")
+        thread_id = entry.get("thread_id")
+        message_id = str(entry.get("progress_message_id") or "")
+        last_rendered = str(entry.get("progress_rendered_text") or "")
+
+        if not chat_id or not thread_id:
+            return False
+
+        if content == last_rendered:
+            now = time.time()
+            with _STATE_LOCK:
+                state = _load_state(self.state_path)
+                topic = state.get("topics", {}).get(session_id)
+                if topic is not None:
+                    topic["last_message_ts"] = now
+                    _save_state(self.state_path, state)
+            return True
+
+        if message_id:
+            try:
+                result = await adapter.edit_message(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    content=content,
+                )
+                if result.success:
+                    now = time.time()
+                    with _STATE_LOCK:
+                        state = _load_state(self.state_path)
+                        topic = state.get("topics", {}).get(session_id)
+                        if topic is not None:
+                            topic["last_message_ts"] = now
+                            topic["progress_rendered_text"] = content
+                            _save_state(self.state_path, state)
+                    return True
+            except Exception as e:
+                self.logger.warning(
+                    "Subagent topic edit failed for session %s: %s",
+                    session_id, e, exc_info=True,
+                )
+
+        try:
+            result = await adapter.send(
+                chat_id=chat_id,
+                content=content,
+                metadata={"thread_id": int(thread_id)},
+            )
+            if result.success:
+                now = time.time()
+                with _STATE_LOCK:
+                    state = _load_state(self.state_path)
+                    topic = state.get("topics", {}).get(session_id)
+                    if topic is not None:
+                        topic["last_message_ts"] = now
+                        topic["progress_rendered_text"] = content
+                        if result.message_id:
+                            topic["progress_message_id"] = str(result.message_id)
+                        _save_state(self.state_path, state)
+                return True
+        except Exception as e:
+            self.logger.warning(
+                "Subagent topic send fallback failed for session %s: %s",
+                session_id, e, exc_info=True,
+            )
+        return False
 
 
 def _clean_for_topic(text: str) -> str:

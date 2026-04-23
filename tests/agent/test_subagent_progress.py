@@ -155,6 +155,7 @@ class TestBuildChildProgressCallback:
 
         cb = _build_child_progress_callback(0, "test goal", parent)
         cb("_thinking", "some reasoning text")
+        cb._flush()
 
         parent_cb.assert_called_once()
         assert parent_cb.call_args.args[0] == "subagent.thinking"
@@ -383,7 +384,24 @@ class TestBatchFlush:
         cb("tool.started", "web_search", "test", {})
         cb._flush()  # Should not crash
 
+    def test_thinking_deltas_are_coalesced_before_gateway(self):
+        """Tiny reasoning fragments should be buffered into one useful update."""
+        parent = MagicMock()
+        parent._delegate_spinner = None
+        parent_cb = MagicMock()
+        parent.tool_progress_callback = parent_cb
 
+        cb = _build_child_progress_callback(0, "test goal", parent)
+        for delta in ["Evaluate ", "the ", "current ", "issue "]:
+            cb("_thinking", delta)
+
+        parent_cb.assert_not_called()
+
+        cb("tool.started", "read_file", "notes.txt", {})
+
+        events = [c.args[0] for c in parent_cb.call_args_list]
+        assert events[0] == "subagent.thinking"
+        preview = parent_cb.call_args_list[0].kwargs.get("preview") or parent_cb.call_args_list[0].args[2]
+        assert "Evaluate the current issue" in preview
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-

@@ -90,6 +90,9 @@ def adapter() -> MagicMock:
     mock.send = AsyncMock(
         return_value=SimpleNamespace(success=True, message_id="m1")
     )
+    mock.edit_message = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="m1")
+    )
     return mock
 
 
@@ -350,6 +353,30 @@ class TestFormatEvent:
         assert out.startswith("· ")
 
 
+class TestRenderProgressMessage:
+    def test_goal_only_on_start(self, router: SubagentTopicRouter):
+        entry = {"topic_name": "SA Analyze", "goal": "Analyze the 48 local commits and propose conservative topic groupings before sync"}
+
+        first = router._render_progress_message(
+            session_id="sess1234",
+            entry=entry,
+            event_text="🔀 Started: Analyze the 48 local commits",
+            include_goal=True,
+        )
+        assert "Goal:" in first
+        assert "Analyze the 48 local commits" in first
+
+        later = router._render_progress_message(
+            session_id="sess1234",
+            entry=entry,
+            event_text="💭 Using search_files for package files could work",
+            include_goal=False,
+        )
+        assert "Goal:" not in later
+        assert later.startswith("🔀 SA Analyze")
+        assert "💭 Using search_files" in later
+
+
 # ---------------------------------------------------------------------------
 # B. State I/O
 # ---------------------------------------------------------------------------
@@ -518,13 +545,18 @@ class TestRouterAsyncRoute:
         assert kwargs["chat_id"] == str(telegram_source.chat_id)
         assert kwargs["launch_agent"] is False
 
-        # adapter.send is called 3 times on the create path:
+        # adapter.send is called 2 times on the create path:
         #   1. pointer message in parent chat
         #   2. opening message inside the new topic
-        #   3. the triggering event itself forwarded to the new topic
-        # The router re-loads state from disk after lazy_create_topic so the
-        # first event is not silently dropped.
-        assert adapter.send.await_count == 3
+        # The first progress event then edits the opening message in place.
+        assert adapter.send.await_count == 2
+        assert adapter.edit_message.await_count == 1
+
+        edit_kwargs = adapter.edit_message.call_args.kwargs
+        assert edit_kwargs["chat_id"] == str(telegram_source.chat_id)
+        assert edit_kwargs["message_id"] == "m1"
+        assert edit_kwargs["content"].startswith("🔀 SA ")
+        assert "🔀 Started: kick off" in edit_kwargs["content"]
 
         # State file persists mapping.
         state = _load_state(router.state_path)
@@ -555,9 +587,9 @@ class TestRouterAsyncRoute:
             goal="Reasonable goal text",
             adapter=adapter,
         )
-        count_after_create = adapter.send.await_count
+        count_after_create = adapter.edit_message.await_count
 
-        # Event 2 — topic already exists, so the actual event is forwarded.
+        # Event 2 — topic already exists, so the actual event edits the same message.
         await router._async_route(
             session_id="sid_seq",
             source=telegram_source,
@@ -567,7 +599,8 @@ class TestRouterAsyncRoute:
             goal=None,
             adapter=adapter,
         )
-        assert adapter.send.await_count == count_after_create + 1
+        assert adapter.send.await_count == 2
+        assert adapter.edit_message.await_count == count_after_create + 1
         # Topic op not re-run.
         patched_topic_tool.run_op.assert_awaited_once()
 
@@ -613,7 +646,8 @@ class TestRouterAsyncRoute:
         _, kwargs = adapter.send.call_args
         assert kwargs["chat_id"] == str(telegram_source.chat_id)
         assert kwargs["metadata"]["thread_id"] == 5555
-        assert kwargs["content"].startswith("⏳")
+        assert kwargs["content"].startswith("🔀 SA existing")
+        assert "⏳ tick" in kwargs["content"]
 
     @pytest.mark.asyncio
     async def test_updates_last_message_ts(
@@ -1160,9 +1194,10 @@ class TestRouterAsyncRoute:
         assert entry["thread_id"] == "999"
         assert entry["topic_name"] == "SA fresh"
 
-        # adapter.send fires 3 times on the rebuild path: pointer, opening,
-        # and the forwarded event itself (same shape as first-time create).
-        assert adapter.send.await_count == 3
+        # adapter.send fires 2 times on the rebuild path: pointer + opening.
+        # The rebuilt topic's opening message is then edited in place.
+        assert adapter.send.await_count == 2
+        assert adapter.edit_message.await_count == 1
 
     @pytest.mark.asyncio
     async def test_subagent_start_keeps_entry_on_transient_rename_failure(

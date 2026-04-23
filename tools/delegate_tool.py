@@ -488,6 +488,12 @@ _HEARTBEAT_STALE_CYCLES_IDLE = 5  # 5 * 30s = 150s idle between turns → stale
 _HEARTBEAT_STALE_CYCLES_IN_TOOL = 20  # 20 * 30s = 600s stuck on same tool → stale
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 
+# Reasoning deltas can arrive token-by-token from streaming providers.
+# Buffer tiny chunks so Telegram / CLI do not spam one update per word.
+_REASONING_IMMEDIATE_MIN_CHARS = 20
+_REASONING_FLUSH_CHARS = 120
+_REASONING_END_PUNCT = (".", "!", "?", "。", "！", "？")
+
 
 # ---------------------------------------------------------------------------
 # Delegation progress event types
@@ -686,6 +692,7 @@ def _build_child_progress_callback(
     _BATCH_SIZE = 5
     _batch: List[str] = []
     _tool_count = [0]  # per-subagent running counter (list for closure mutation)
+    _reasoning_batch: List[str] = []
 
     def _identity_kwargs() -> Dict[str, Any]:
         kw: Dict[str, Any] = {
@@ -718,11 +725,42 @@ def _build_child_progress_callback(
         except Exception as e:
             logger.debug("Parent callback failed: %s", e)
 
+    def _emit_reasoning(text: str) -> None:
+        if not text:
+            return
+        if spinner:
+            short = (text[:55] + "...") if len(text) > 55 else text
+            try:
+                spinner.print_above(f" {prefix}├─ 💭 {short}")
+            except Exception as e:
+                logger.debug("Spinner print_above failed: %s", e)
+        _relay("subagent.thinking", preview=text)
+
+    def _flush_reasoning(*, force: bool = False) -> None:
+        if not _reasoning_batch:
+            return
+
+        text = "".join(_reasoning_batch).strip()
+        if not text:
+            _reasoning_batch.clear()
+            return
+
+        if not force:
+            trimmed = text.rstrip()
+            if len(trimmed) < _REASONING_FLUSH_CHARS and not trimmed.endswith(_REASONING_END_PUNCT):
+                return
+
+        _reasoning_batch.clear()
+        _emit_reasoning(text)
+
     def _callback(
         event_type, tool_name: str = None, preview: str = None, args=None, **kwargs
     ):
         # Lifecycle events emitted by the orchestrator itself — handled
         # before enum normalisation since they are not part of DelegateEvent.
+        if event_type not in ("_thinking", "reasoning.available"):
+            _flush_reasoning(force=True)
+
         if event_type == "subagent.start":
             if spinner and goal_label:
                 short = (
@@ -755,13 +793,22 @@ def _build_child_progress_callback(
 
         if event == DelegateEvent.TASK_THINKING:
             text = preview or tool_name or ""
-            if spinner:
-                short = (text[:55] + "...") if len(text) > 55 else text
-                try:
-                    spinner.print_above(f' {prefix}├─ 💭 "{short}"')
-                except Exception as e:
-                    logger.debug("Spinner print_above failed: %s", e)
-            _relay("subagent.thinking", preview=text)
+            normalized = text.strip()
+            if not normalized:
+                return
+
+            # CLI / non-gateway paths keep the old immediate spinner behaviour.
+            # We only buffer when there is a parent callback to protect the
+            # Telegram progress topic from token-level spam.
+            if parent_cb is None:
+                _emit_reasoning(normalized)
+                return
+
+            if not _reasoning_batch and len(normalized) > _REASONING_IMMEDIATE_MIN_CHARS:
+                _emit_reasoning(normalized)
+                return
+            _reasoning_batch.append(text)
+            _flush_reasoning(force=False)
             return
 
         if event == DelegateEvent.TASK_TOOL_COMPLETED:
@@ -823,6 +870,7 @@ def _build_child_progress_callback(
 
     def _flush():
         """Flush remaining batched tool names to gateway on completion."""
+        _flush_reasoning(force=True)
         if parent_cb and _batch:
             summary = ", ".join(_batch)
             _relay("subagent.progress", preview=f"🔀 {prefix}{summary}")
@@ -966,18 +1014,22 @@ def _build_child_agent(
     # total iterations across parent + subagents can exceed the parent's
     # max_iterations.  The user controls the per-subagent cap in config.yaml.
 
-    child_thinking_cb = None
+    child_reasoning_cb = None
     if child_progress_cb:
 
-        def _child_thinking(text: str) -> None:
+        def _child_reasoning(text: str) -> None:
             if not text:
                 return
             try:
+                # Relay real reasoning content through the existing
+                # subagent.thinking plumbing, but do not use the agent's
+                # synthetic thinking_callback (which emits "reasoning..."
+                # status text).
                 child_progress_cb("_thinking", text)
             except Exception as e:
-                logger.debug("Child thinking callback relay failed: %s", e)
+                logger.debug("Child reasoning callback relay failed: %s", e)
 
-        child_thinking_cb = _child_thinking
+        child_reasoning_cb = _child_reasoning
 
     # Resolve effective credentials: config override > parent inherit
     effective_model = model or parent_agent.model
@@ -1031,6 +1083,7 @@ def _build_child_agent(
         max_tokens=getattr(parent_agent, "max_tokens", None),
         reasoning_config=child_reasoning,
         prefill_messages=getattr(parent_agent, "prefill_messages", None),
+        reasoning_callback=child_reasoning_cb,
         enabled_toolsets=child_toolsets,
         quiet_mode=True,
         ephemeral_system_prompt=child_prompt,
@@ -1039,7 +1092,7 @@ def _build_child_agent(
         skip_context_files=True,
         skip_memory=True,
         clarify_callback=None,
-        thinking_callback=child_thinking_cb,
+        thinking_callback=None,
         session_db=getattr(parent_agent, "_session_db", None),
         parent_session_id=getattr(parent_agent, "session_id", None),
         providers_allowed=parent_agent.providers_allowed,
