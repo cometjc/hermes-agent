@@ -13,6 +13,8 @@ import itertools
 import json
 import logging
 import os
+import queue
+import shutil
 import tempfile
 import html as _html
 import re
@@ -21,7 +23,16 @@ from typing import Dict, List, Optional, Any
 logger = logging.getLogger(__name__)
 
 try:
-    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import (
+        Update,
+        Bot,
+        Message,
+        InlineKeyboardButton,
+        InlineKeyboardMarkup,
+        ReplyKeyboardMarkup,
+        ReplyKeyboardRemove,
+        KeyboardButton,
+    )
     try:
         from telegram import LinkPreviewOptions
     except ImportError:
@@ -44,6 +55,9 @@ except ImportError:
     Message = Any
     InlineKeyboardButton = Any
     InlineKeyboardMarkup = Any
+    ReplyKeyboardMarkup = Any
+    ReplyKeyboardRemove = Any
+    KeyboardButton = Any
     LinkPreviewOptions = None
     Application = Any
     CommandHandler = Any
@@ -253,9 +267,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._model_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
-        # Clarify prompt state: clarify_id → pending request metadata
+        # Pending steer reactions that should be cleared when the turn ends.
+        self._pending_steer_reactions: Dict[str, list[tuple[str, str]]] = {}
+        # Clarify reply state: chat/thread key → pending response state
         self._clarify_pending: Dict[str, dict] = {}
-        self._clarify_counter = itertools.count(1)
+        self._clarify_counter: int = 0
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     @staticmethod
@@ -267,183 +283,242 @@ class TelegramAdapter(BasePlatformAdapter):
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or user_id in allowed_ids
 
-    def build_clarify_callback(
+    @staticmethod
+    def _clarify_pending_key(chat_id: str, thread_id: Optional[str]) -> str:
+        thread_part = str(thread_id) if thread_id not in (None, "") else ""
+        return f"{chat_id}|{thread_part}"
+
+    def _build_clarify_reply_keyboard(self, choices: list[str]):
+        """Build a Telegram reply keyboard for clarify choices."""
+        if not choices:
+            return None
+        rows = [[KeyboardButton(choice)] for choice in choices]
+        return ReplyKeyboardMarkup(
+            rows,
+            resize_keyboard=True,
+            one_time_keyboard=True,
+            selective=True,
+        )
+
+    async def _send_message_with_retry(
         self,
         *,
-        chat_id: str,
-        thread_id: Optional[str],
-        user_id: str,
-    ):
-        """Build a blocking clarify(question, choices) callback for AIAgent.
+        context: str,
+        **kwargs: Any,
+    ) -> Any:
+        """Send a Telegram message with the same retry policy as `send()`.
 
-        The returned callable runs in the agent worker thread, sends a Telegram
-        inline keyboard on the gateway loop, then blocks until the matching
-        ``clr:`` callback query resolves the pending Future.
+        Clarify prompts bypass `send()` because they need reply keyboards and
+        thread-specific reply metadata. Reusing the same flood-control retry
+        policy keeps clarify prompts from failing fast when Telegram returns
+        `retry_after`.
         """
+        if not self._bot:
+            raise RuntimeError("Not connected")
 
-        def _clarify(question: str, choices: Optional[list[str]] = None) -> str:
-            if not self._bot:
-                return "Clarify is not available: Telegram is not connected."
-            if not self._loop or self._loop.is_closed():
-                return "Clarify is not available in this execution context."
-
-            clean_choices = [str(c).strip() for c in (choices or []) if str(c).strip()][:4]
-            if not clean_choices:
-                return "Clarify is not available in this execution context."
-
-            clarify_id = f"cl:{next(self._clarify_counter)}"
-            response_future: concurrent.futures.Future[str] = concurrent.futures.Future()
-
-            send_future = asyncio.run_coroutine_threadsafe(
-                self._send_clarify_prompt(
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    clarify_id=clarify_id,
-                    question=question,
-                    choices=clean_choices,
-                ),
-                self._loop,
-            )
-
+        for attempt in range(3):
             try:
-                send_result = send_future.result(timeout=30)
-            except Exception as exc:
-                return f"Failed to send clarify prompt: {exc}"
-
-            if not send_result or not send_result.success:
-                return f"Failed to send clarify prompt: {getattr(send_result, 'error', 'unknown error')}"
-
-            self._clarify_pending[clarify_id] = {
-                "future": response_future,
-                "user_id": str(user_id),
-                "chat_id": str(chat_id),
-                "thread_id": str(thread_id) if thread_id is not None else None,
-                "message_id": str(send_result.message_id) if send_result.message_id is not None else None,
-                "choices": clean_choices,
-            }
-
-            timeout_s = float(os.getenv("HERMES_TELEGRAM_CLARIFY_TIMEOUT", "120"))
-            timeout_message = (
-                "The user did not provide a response within the time limit. "
-                "Use your best judgement to make the choice and proceed."
-            )
-
-            try:
-                return response_future.result(timeout=timeout_s)
-            except concurrent.futures.TimeoutError:
-                pending = self._clarify_pending.pop(clarify_id, None)
-                if pending and pending.get("message_id"):
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            self._clear_clarify_markup(
-                                chat_id=chat_id,
-                                message_id=str(pending["message_id"]),
-                                thread_id=thread_id,
-                            ),
-                            self._loop,
+                return await self._bot.send_message(**kwargs)
+            except Exception as send_err:
+                retry_after = getattr(send_err, "retry_after", None)
+                if retry_after is not None or "retry after" in str(send_err).lower():
+                    if attempt < 2:
+                        wait = float(retry_after) if retry_after is not None else 1.0
+                        logger.warning(
+                            "[%s] Telegram flood control on %s (attempt %d/3), retrying in %.1fs: %s",
+                            self.name,
+                            context,
+                            attempt + 1,
+                            wait,
+                            send_err,
                         )
-                    except Exception:
-                        pass
-                return timeout_message
-            finally:
-                self._clarify_pending.pop(clarify_id, None)
-
-        return _clarify
+                        await asyncio.sleep(wait)
+                        continue
+                raise
 
     async def _send_clarify_prompt(
         self,
         *,
         chat_id: str,
         thread_id: Optional[str],
-        clarify_id: str,
+        reply_to_message_id: Optional[str],
         question: str,
         choices: list[str],
-    ) -> SendResult:
+    ) -> Optional[str]:
+        """Send the clarify prompt into Telegram and return the message id."""
         if not self._bot:
-            return SendResult(success=False, error="Not connected")
+            raise RuntimeError("Not connected")
 
-        rows = [[InlineKeyboardButton(label, callback_data=f"clr:{clarify_id}:{idx}")]
-                for idx, label in enumerate(choices)]
-        keyboard = InlineKeyboardMarkup(rows)
+        text_lines = ["❓ Clarify needed", "", question]
+        if choices:
+            text_lines.extend(["", "Choices:"])
+            text_lines.extend(f"{idx + 1}. {choice}" for idx, choice in enumerate(choices))
+
         kwargs: Dict[str, Any] = {
             "chat_id": int(chat_id),
-            "text": f"❓ {question}",
-            "reply_markup": keyboard,
+            "text": "\n".join(text_lines),
             **self._link_preview_kwargs(),
         }
         message_thread_id = self._message_thread_id_for_send(thread_id)
         if message_thread_id is not None:
             kwargs["message_thread_id"] = message_thread_id
-        msg = await self._bot.send_message(**kwargs)
-        return SendResult(success=True, message_id=str(msg.message_id))
+        if reply_to_message_id not in (None, ""):
+            kwargs["reply_to_message_id"] = int(reply_to_message_id)
+        keyboard = self._build_clarify_reply_keyboard(choices)
+        if keyboard is not None:
+            kwargs["reply_markup"] = keyboard
 
-    async def _clear_clarify_markup(
+        msg = await self._send_message_with_retry(context="clarify prompt", **kwargs)
+        return str(getattr(msg, "message_id", "")) or None
+
+    async def _clear_clarify_keyboard(
         self,
         *,
         chat_id: str,
-        message_id: str,
         thread_id: Optional[str],
+        reply_to_message_id: Optional[str],
+        text: str,
     ) -> None:
+        """Send a small cleanup message that removes the reply keyboard."""
         if not self._bot:
             return
+
         kwargs: Dict[str, Any] = {
             "chat_id": int(chat_id),
-            "message_id": int(message_id),
-            "reply_markup": None,
+            "text": text,
+            "reply_markup": ReplyKeyboardRemove(selective=True),
+            **self._link_preview_kwargs(),
         }
         message_thread_id = self._message_thread_id_for_send(thread_id)
         if message_thread_id is not None:
             kwargs["message_thread_id"] = message_thread_id
+        if reply_to_message_id not in (None, ""):
+            kwargs["reply_to_message_id"] = int(reply_to_message_id)
         try:
-            await self._bot.edit_message_reply_markup(**kwargs)
+            await self._bot.send_message(**kwargs)
         except Exception:
-            pass
+            logger.debug("[%s] Failed to clear Telegram clarify keyboard", self.name, exc_info=True)
 
-    async def _handle_clarify_callback(self, query, data: str) -> None:
-        parts = data.split(":", 2)
-        if len(parts) != 3:
-            await query.answer(text="Invalid clarify data.")
-            return
+    async def _resolve_pending_clarify_from_message(self, message: Message) -> bool:
+        """Resolve a pending clarify prompt from an incoming text message."""
+        if not getattr(message, "text", None):
+            return False
 
-        clarify_id = parts[1]
-        try:
-            choice_idx = int(parts[2])
-        except ValueError:
-            await query.answer(text="Invalid clarify choice.")
-            return
+        chat = getattr(message, "chat", None)
+        chat_id = str(getattr(chat, "id", ""))
+        if not chat_id:
+            return False
 
-        pending = self._clarify_pending.get(clarify_id)
-        if not pending:
-            await query.answer(text="This clarify request has already been resolved.")
-            return
+        thread_id = getattr(message, "message_thread_id", None)
+        pending_key = self._clarify_pending_key(chat_id, thread_id)
+        state = self._clarify_pending.get(pending_key)
+        if not state:
+            return False
 
-        caller_id = str(getattr(query.from_user, "id", ""))
-        expected_user_id = str(pending.get("user_id", ""))
+        reply_to_message_id = state.get("reply_to_message_id")
+        caller_id = str(getattr(getattr(message, "from_user", None), "id", ""))
+        expected_user_id = state.get("user_id")
         if expected_user_id and caller_id != expected_user_id:
-            await query.answer(text="⛔ You are not authorized to answer this clarification.")
-            return
+            return False
 
-        choices = pending.get("choices") or []
-        if choice_idx < 0 or choice_idx >= len(choices):
-            await query.answer(text="Invalid clarify choice.")
-            return
+        response = str(message.text).strip()
+        if not response:
+            return False
 
-        choice = choices[choice_idx]
-        future = pending.get("future")
-        if future and not future.done():
-            future.set_result(choice)
+        response_queue = state.get("response_queue")
+        if response_queue is None:
+            self._clarify_pending.pop(pending_key, None)
+            return False
 
-        self._clarify_pending.pop(clarify_id, None)
-
+        self._clarify_pending.pop(pending_key, None)
         try:
-            await query.edit_message_reply_markup(reply_markup=None)
+            response_queue.put_nowait(response)
         except Exception:
-            pass
-        try:
-            await query.answer(text=f"Selected: {choice}")
-        except Exception:
-            pass
+            try:
+                response_queue.put(response, timeout=0.1)
+            except Exception:
+                pass
 
+        await self._clear_clarify_keyboard(
+            chat_id=chat_id,
+            thread_id=str(thread_id) if thread_id is not None else None,
+            reply_to_message_id=reply_to_message_id,
+            text=f"✅ 收到：{response}",
+        )
+        return True
+
+    def build_clarify_callback(self, *, chat_id, thread_id, user_id, reply_to_message_id=None):
+        """Build a sync clarify callback backed by Telegram reply keyboards."""
+        pending_key = self._clarify_pending_key(str(chat_id), thread_id)
+
+        def _callback(question, choices):
+            loop = getattr(self, "_loop", None)
+            if loop is None or not self._bot:
+                raise RuntimeError("Telegram adapter is not connected")
+
+            timeout = self.config.extra.get("clarify_timeout", 120) if getattr(self.config, "extra", None) else 120
+            try:
+                timeout = float(timeout)
+            except (TypeError, ValueError):
+                timeout = 120.0
+
+            normalized_choices = [str(choice).strip() for choice in (choices or []) if str(choice).strip()]
+            response_queue: queue.Queue[str] = queue.Queue(maxsize=1)
+
+            if pending_key in self._clarify_pending:
+                raise RuntimeError("A Telegram clarify prompt is already pending for this chat.")
+
+            self._clarify_counter += 1
+            self._clarify_pending[pending_key] = {
+                "question": question,
+                "choices": normalized_choices,
+                "response_queue": response_queue,
+                "user_id": str(user_id) if user_id is not None else "",
+                "thread_id": str(thread_id) if thread_id is not None else None,
+                "reply_to_message_id": str(reply_to_message_id) if reply_to_message_id not in (None, "") else None,
+            }
+
+            send_future = asyncio.run_coroutine_threadsafe(
+                self._send_clarify_prompt(
+                    chat_id=str(chat_id),
+                    thread_id=str(thread_id) if thread_id is not None else None,
+                    reply_to_message_id=str(reply_to_message_id) if reply_to_message_id not in (None, "") else None,
+                    question=str(question).strip() if question else "",
+                    choices=normalized_choices,
+                ),
+                loop,
+            )
+            try:
+                send_future.result(timeout=30)
+            except Exception as exc:
+                self._clarify_pending.pop(pending_key, None)
+                raise RuntimeError(f"Failed to send Telegram clarify prompt: {exc}") from exc
+
+            try:
+                response = response_queue.get(timeout=timeout)
+            except queue.Empty:
+                self._clarify_pending.pop(pending_key, None)
+                cleanup_future = asyncio.run_coroutine_threadsafe(
+                    self._clear_clarify_keyboard(
+                        chat_id=str(chat_id),
+                        thread_id=str(thread_id) if thread_id is not None else None,
+                        reply_to_message_id=str(reply_to_message_id) if reply_to_message_id not in (None, "") else None,
+                        text="⏱️ Clarify timed out — the agent will decide.",
+                    ),
+                    loop,
+                )
+                try:
+                    cleanup_future.result(timeout=5)
+                except Exception:
+                    pass
+                return (
+                    "The user did not provide a response within the time limit. "
+                    "Use your best judgement to make the choice and proceed."
+                )
+
+            return str(response).strip()
+
+        return _callback
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
         if not metadata:
@@ -849,6 +924,8 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
+
+            self._loop = asyncio.get_running_loop()
 
             # Build the application
             builder = Application.builder().token(self.config.token)
@@ -2603,6 +2680,8 @@ class TelegramAdapter(BasePlatformAdapter):
         them into a single MessageEvent before dispatching.
         """
         if not update.message or not update.message.text:
+            return
+        if await self._resolve_pending_clarify_from_message(update.message):
             return
         if not self._should_process_message(update.message):
             return

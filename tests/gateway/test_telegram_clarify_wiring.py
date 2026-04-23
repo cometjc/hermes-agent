@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -19,9 +17,9 @@ from gateway.session import SessionSource
 
 
 class _StubTelegramAdapter:
-    def build_clarify_callback(self, *, chat_id, thread_id, user_id):
+    def build_clarify_callback(self, *, chat_id, thread_id, user_id, reply_to_message_id=None):
         def _cb(question, choices):
-            return f"{chat_id}|{thread_id}|{user_id}|{question}|{choices}"
+            return f"{chat_id}|{thread_id}|{user_id}|{reply_to_message_id}|{question}|{choices}"
         return _cb
 
 
@@ -37,7 +35,7 @@ def test_build_telegram_clarify_callback_only_for_telegram(platform, expected):
         thread_id="99",
     )
 
-    callback = runner._build_telegram_clarify_callback(source)
+    callback = runner._build_telegram_clarify_callback(source, event_message_id="456")
     assert callable(callback) is expected
     if expected:
-        assert callback("Q?", ["A", "B"]) == "12345|99|777|Q?|['A', 'B']"
+        assert callback("Q?", ["A", "B"]) == "12345|99|777|456|Q?|['A', 'B']"
