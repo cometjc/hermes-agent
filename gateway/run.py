@@ -321,6 +321,12 @@ from gateway.platforms.base import (
     MessageType,
     merge_pending_message_event,
 )
+from gateway.progress_batch import (
+    send_telegram_progress_lines,
+    telegram_progress_fits,
+    telegram_progress_rendered_length,
+    telegram_progress_safe_limit,
+)
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
@@ -9444,25 +9450,103 @@ class GatewayRunner:
                         break
                 return
 
+            if not progress_queue:
+                return
+
+            adapter = self.adapters.get(source.platform)
+            if not adapter:
+                return
+
             progress_lines = []      # Accumulated tool lines
+
             progress_msg_id = None   # ID of the progress message to edit
             can_edit = True          # False once an edit fails (platform doesn't support it)
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
+            is_telegram = source.platform == Platform.TELEGRAM
+
+            async def _emit_progress_batch(lines: list[str], *, force_new: bool = False) -> None:
+                nonlocal progress_msg_id, can_edit, _last_edit_ts
+                if not lines:
+                    return
+
+                rendered_length = None
+                limit = None
+                if is_telegram:
+                    rendered_length = telegram_progress_rendered_length(adapter, lines)
+                    limit = telegram_progress_safe_limit(adapter)
+
+                should_edit = (
+                    not force_new
+                    and can_edit
+                    and progress_msg_id is not None
+                    and (not is_telegram or (rendered_length is not None and rendered_length <= limit))
+                )
+
+                if should_edit:
+                    try:
+                        result = await adapter.edit_message(
+                            chat_id=source.chat_id,
+                            message_id=progress_msg_id,
+                            content='\n'.join(lines),
+                        )
+                        if result.success:
+                            if result.message_id:
+                                progress_msg_id = result.message_id
+                            _last_edit_ts = time.monotonic()
+                            return
+                        _err = (getattr(result, 'error', '') or '').lower()
+                        if 'flood' in _err or 'retry after' in _err:
+                            logger.info(
+                                '[%s] Progress edits disabled due to flood control',
+                                adapter.name,
+                            )
+                            can_edit = False
+                    except Exception as exc:
+                        _err = str(exc).lower()
+                        if 'flood' in _err or 'retry after' in _err:
+                            logger.info(
+                                '[%s] Progress edits disabled due to flood control',
+                                adapter.name,
+                            )
+                            can_edit = False
+
+                if is_telegram and rendered_length is not None and limit is not None and rendered_length > limit:
+                    result = await send_telegram_progress_lines(
+                        adapter,
+                        source.chat_id,
+                        lines,
+                        metadata=_progress_metadata,
+                    )
+                else:
+                    result = await adapter.send(
+                        chat_id=source.chat_id,
+                        content='\n'.join(lines),
+                        metadata=_progress_metadata,
+                    )
+                if result.success and result.message_id:
+                    progress_msg_id = result.message_id
+                _last_edit_ts = time.monotonic()
 
             while True:
                 try:
                     raw = progress_queue.get_nowait()
 
                     # Handle dedup messages: update last line with repeat counter
-                    if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                    if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == '__dedup__':
                         _, base_msg, count = raw
-                        if progress_lines:
-                            progress_lines[-1] = f"{base_msg} (×{count + 1})"
-                        msg = progress_lines[-1] if progress_lines else base_msg
+                        candidate_lines = list(progress_lines)
+                        if candidate_lines:
+                            candidate_lines[-1] = f'{base_msg} (×{count + 1})'
+                        msg = candidate_lines[-1] if candidate_lines else base_msg
                     else:
                         msg = raw
-                        progress_lines.append(msg)
+                        candidate_lines = list(progress_lines)
+                        candidate_lines.append(msg)
+
+                    projected_fits = True
+                    if is_telegram:
+                        projected_fits = telegram_progress_fits(adapter, candidate_lines)
 
                     # Throttle edits: batch rapid tool updates into fewer
                     # API calls to avoid hitting Telegram flood control.
@@ -9470,81 +9554,48 @@ class GatewayRunner:
                     # instead of reacting to 429s.)
                     _now = time.monotonic()
                     _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
-                    if _remaining > 0:
-                        # Wait out the throttle interval, then loop back to
-                        # drain any additional queued messages before sending
-                        # a single batched edit.
-                        await asyncio.sleep(_remaining)
-                        continue
 
-                    if can_edit and progress_msg_id is not None:
-                        # Try to edit the existing progress message
-                        full_text = "\n".join(progress_lines)
-                        result = await adapter.edit_message(
-                            chat_id=source.chat_id,
-                            message_id=progress_msg_id,
-                            content=full_text,
-                        )
-                        if not result.success:
-                            _err = (getattr(result, "error", "") or "").lower()
-                            if "flood" in _err or "retry after" in _err:
-                                # Flood control hit — disable further edits,
-                                # switch to sending new messages only for
-                                # important updates.  Don't block 23s.
-                                logger.info(
-                                    "[%s] Progress edits disabled due to flood control",
-                                    adapter.name,
-                                )
-                            can_edit = False
-                            await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
+                    if projected_fits:
+                        progress_lines = candidate_lines
+                        if _remaining > 0:
+                            # Wait out the throttle interval, then loop back to
+                            # drain any additional queued messages before sending
+                            # a single batched edit.
+                            await asyncio.sleep(_remaining)
+                            continue
+                        await _emit_progress_batch(progress_lines)
                     else:
-                        if can_edit:
-                            # First tool: send all accumulated text as new message
-                            full_text = "\n".join(progress_lines)
-                            result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
-                        else:
-                            # Editing unsupported: send just this line
-                            result = await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
-                        if result.success and result.message_id:
-                            progress_msg_id = result.message_id
-
-                    _last_edit_ts = time.monotonic()
-
-                    # Restore typing indicator
-                    await asyncio.sleep(0.3)
-                    await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
+                        # Rollover before Telegram overflows: flush the existing
+                        # batch, then start a fresh message for the overflow line.
+                        if progress_lines:
+                            await _emit_progress_batch(progress_lines)
+                        progress_lines = candidate_lines if isinstance(raw, tuple) else [msg]
+                        await _emit_progress_batch(progress_lines, force_new=True)
 
                 except queue.Empty:
                     await asyncio.sleep(0.3)
                 except asyncio.CancelledError:
-                    # Drain remaining queued messages
+                    # Drain remaining queued messages using the same size checks.
                     while not progress_queue.empty():
                         try:
                             raw = progress_queue.get_nowait()
-                            if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                            if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == '__dedup__':
                                 _, base_msg, count = raw
                                 if progress_lines:
-                                    progress_lines[-1] = f"{base_msg} (×{count + 1})"
+                                    progress_lines[-1] = f'{base_msg} (×{count + 1})'
                             else:
                                 progress_lines.append(raw)
                         except Exception:
                             break
-                    # Final edit with all remaining tools (only if editing works)
-                    if can_edit and progress_lines and progress_msg_id:
-                        full_text = "\n".join(progress_lines)
+                    if progress_lines:
                         try:
-                            await adapter.edit_message(
-                                chat_id=source.chat_id,
-                                message_id=progress_msg_id,
-                                content=full_text,
-                            )
+                            await _emit_progress_batch(progress_lines)
                         except Exception:
                             pass
                     return
                 except Exception as e:
-                    logger.error("Progress message error: %s", e)
+                    logger.error('Progress message error: %s', e)
                     await asyncio.sleep(1)
-        
         # We need to share the agent instance for interrupt support
         agent_holder = [None]  # Mutable container for the agent instance
         result_holder = [None]  # Mutable container for the result
