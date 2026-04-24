@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import re
 import shlex
 import sys
@@ -40,6 +41,58 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 # from _enforce_agent_cache_cap() and _session_expiry_watcher() below.
 _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
+
+
+class _GatewayWorker:
+    """Single long-lived worker thread for sync agent turns.
+
+    We avoid asyncio's default executor for the main gateway agent path because
+    Python 3.13's Runner.close() -> shutdown_default_executor() can hang in our
+    test environment even after the sync work has returned.
+    """
+
+    def __init__(self, *, name: str = "gateway-agent-worker") -> None:
+        self._jobs: "queue.Queue[tuple | None]" = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._worker_loop,
+            name=name,
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _worker_loop(self) -> None:
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            loop, ctx, func, args, future = job
+            try:
+                result = ctx.run(func, *args)
+            except Exception as exc:
+                loop.call_soon_threadsafe(self._set_future_exception, future, exc)
+            else:
+                loop.call_soon_threadsafe(self._set_future_result, future, result)
+
+    @staticmethod
+    def _set_future_result(future: asyncio.Future, value: Any) -> None:
+        if not future.done():
+            future.set_result(value)
+
+    @staticmethod
+    def _set_future_exception(future: asyncio.Future, exc: Exception) -> None:
+        if not future.done():
+            future.set_exception(exc)
+
+    async def run(self, func, *args):
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._jobs.put((loop, copy_context(), func, args, future))
+        return await future
+
+    def close(self, *, timeout: float = 5.0) -> bool:
+        self._jobs.put(None)
+        self._thread.join(timeout=timeout)
+        return not self._thread.is_alive()
 
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
@@ -730,6 +783,7 @@ class GatewayRunner:
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        self._agent_worker = _GatewayWorker()
 
 
 
@@ -831,6 +885,37 @@ class GatewayRunner:
                 platform.value if platform is not None else "adapter",
                 e,
             )
+
+    def _begin_session_run_generation(self, session_key: str) -> int:
+        """Claim a fresh run generation token for ``session_key``."""
+        if not session_key:
+            return 0
+        generations = self.__dict__.get("_session_run_generation")
+        if generations is None:
+            generations = {}
+            self._session_run_generation = generations
+        next_generation = int(generations.get(session_key, 0)) + 1
+        generations[session_key] = next_generation
+        return next_generation
+
+    def _invalidate_session_run_generation(self, session_key: str, *, reason: str = "") -> int:
+        """Invalidate any in-flight run token for ``session_key``."""
+        generation = self._begin_session_run_generation(session_key)
+        if reason:
+            logger.info(
+                "Invalidated run generation for %s -> %d (%s)",
+                session_key[:20],
+                generation,
+                reason,
+            )
+        return generation
+
+    def _is_session_run_current(self, session_key: str, generation: int) -> bool:
+        """Return True when ``generation`` is still current for ``session_key``."""
+        if not session_key:
+            return True
+        generations = self.__dict__.get("_session_run_generation") or {}
+        return int(generations.get(session_key, 0)) == int(generation)
 
     # -----------------------------------------------------------------
 
@@ -2845,6 +2930,15 @@ class GatewayRunner:
                 cleanup_all_browsers()
             except Exception:
                 pass
+
+            _worker = getattr(self, "_agent_worker", None)
+            if _worker is not None:
+                try:
+                    _closed = _worker.close()
+                    if not _closed:
+                        logger.warning("Gateway agent worker did not stop within timeout")
+                except Exception as _e:
+                    logger.debug("Gateway agent worker close error: %s", _e)
 
             # Close SQLite session DBs so the WAL write lock is released.
             # Without this, --replace and similar restart flows leave the
@@ -8322,7 +8416,22 @@ class GatewayRunner:
         clear_session_vars(tokens)
 
     async def _run_in_executor_with_context(self, func, *args):
-        """Run blocking work in the thread pool while preserving session contextvars."""
+        """Run blocking work while preserving session contextvars.
+
+        Agent turns use a dedicated long-lived worker thread instead of the
+        loop's default executor to avoid Python 3.13 shutdown_default_executor()
+        hangs observed in gateway tests. Fall back to run_in_executor only if
+        worker creation fails unexpectedly.
+        """
+        worker = getattr(self, "_agent_worker", None)
+        if worker is None:
+            try:
+                worker = _GatewayWorker()
+                self._agent_worker = worker
+            except Exception:
+                worker = None
+        if worker is not None:
+            return await worker.run(func, *args)
         loop = asyncio.get_running_loop()
         ctx = copy_context()
         return await loop.run_in_executor(None, ctx.run, func, *args)
@@ -9241,6 +9350,7 @@ class GatewayRunner:
         source: SessionSource,
         session_id: str,
         session_key: str = None,
+        run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
@@ -9271,6 +9381,11 @@ class GatewayRunner:
 
         from run_agent import AIAgent
         import queue
+
+        def _run_still_current() -> bool:
+            if run_generation is None or not session_key:
+                return True
+            return self._is_session_run_current(session_key, run_generation)
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
@@ -9333,6 +9448,8 @@ class GatewayRunner:
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
+            if not _run_still_current():
+                return
 
             # Subagent progress → forum topic router (Telegram only).
             # This branch is independent of tool_progress settings because it
@@ -9611,6 +9728,8 @@ class GatewayRunner:
         _hooks_ref = self.hooks
 
         def _step_callback_sync(iteration: int, prev_tools: list) -> None:
+            if not _run_still_current():
+                return
             try:
                 # prev_tools may be list[str] or list[dict] with "name"/"result"
                 # keys.  Normalise to keep "tool_names" backward-compatible for
@@ -9641,6 +9760,8 @@ class GatewayRunner:
         _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
 
         def _status_callback_sync(event_type: str, message: str) -> None:
+            if not _run_still_current():
+                return
             if not _status_adapter:
                 return
             try:
@@ -9779,6 +9900,8 @@ class GatewayRunner:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+                if not _run_still_current():
+                    return
                 if _stream_consumer is not None:
                     if already_streamed:
                         _stream_consumer.on_segment_break()
@@ -9884,6 +10007,8 @@ class GatewayRunner:
             _bg_review_pending_lock = threading.Lock()
 
             def _deliver_bg_review_message(message: str) -> None:
+                if not _run_still_current():
+                    return
                 if not _status_adapter:
                     return
                 try:
@@ -9908,6 +10033,8 @@ class GatewayRunner:
 
             # Background review delivery — send "💾 Memory updated" etc. to user
             def _bg_review_send(message: str) -> None:
+                if not _run_still_current():
+                    return
                 if not _status_adapter:
                     return
                 if not _bg_review_release.is_set():
