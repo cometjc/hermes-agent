@@ -18,6 +18,7 @@ import dataclasses
 import json
 import logging
 import os
+import queue
 import re
 import shlex
 import sys
@@ -41,6 +42,58 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 # from _enforce_agent_cache_cap() and _session_expiry_watcher() below.
 _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
+
+
+class _GatewayWorker:
+    """Single long-lived worker thread for sync agent turns.
+
+    We avoid asyncio's default executor for the main gateway agent path because
+    Python 3.13's Runner.close() -> shutdown_default_executor() can hang in our
+    test environment even after the sync work has returned.
+    """
+
+    def __init__(self, *, name: str = "gateway-agent-worker") -> None:
+        self._jobs: "queue.Queue[tuple | None]" = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._worker_loop,
+            name=name,
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _worker_loop(self) -> None:
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            loop, ctx, func, args, future = job
+            try:
+                result = ctx.run(func, *args)
+            except Exception as exc:
+                loop.call_soon_threadsafe(self._set_future_exception, future, exc)
+            else:
+                loop.call_soon_threadsafe(self._set_future_result, future, result)
+
+    @staticmethod
+    def _set_future_result(future: asyncio.Future, value: Any) -> None:
+        if not future.done():
+            future.set_result(value)
+
+    @staticmethod
+    def _set_future_exception(future: asyncio.Future, exc: Exception) -> None:
+        if not future.done():
+            future.set_exception(exc)
+
+    async def run(self, func, *args):
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._jobs.put((loop, copy_context(), func, args, future))
+        return await future
+
+    def close(self, *, timeout: float = 5.0) -> bool:
+        self._jobs.put(None)
+        self._thread.join(timeout=timeout)
+        return not self._thread.is_alive()
 
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
@@ -787,6 +840,7 @@ class GatewayRunner:
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        self._agent_worker = _GatewayWorker()
 
 
     def _warn_if_docker_media_delivery_is_risky(self) -> None:
@@ -3063,6 +3117,15 @@ class GatewayRunner:
             # that got respawned between the earlier call and adapter
             # disconnect (defense in depth; safe to call repeatedly).
             _kill_tool_subprocesses("final-cleanup")
+
+            _worker = getattr(self, "_agent_worker", None)
+            if _worker is not None:
+                try:
+                    _closed = _worker.close()
+                    if not _closed:
+                        logger.warning("Gateway agent worker did not stop within timeout")
+                except Exception as _e:
+                    logger.debug("Gateway agent worker close error: %s", _e)
 
             # Close SQLite session DBs so the WAL write lock is released.
             # Without this, --replace and similar restart flows leave the
@@ -8601,7 +8664,22 @@ class GatewayRunner:
         clear_session_vars(tokens)
 
     async def _run_in_executor_with_context(self, func, *args):
-        """Run blocking work in the thread pool while preserving session contextvars."""
+        """Run blocking work while preserving session contextvars.
+
+        Agent turns use a dedicated long-lived worker thread instead of the
+        loop's default executor to avoid Python 3.13 shutdown_default_executor()
+        hangs observed in gateway tests. Fall back to run_in_executor only if
+        worker creation fails unexpectedly.
+        """
+        worker = getattr(self, "_agent_worker", None)
+        if worker is None:
+            try:
+                worker = _GatewayWorker()
+                self._agent_worker = worker
+            except Exception:
+                worker = None
+        if worker is not None:
+            return await worker.run(func, *args)
         loop = asyncio.get_running_loop()
         ctx = copy_context()
         return await loop.run_in_executor(None, ctx.run, func, *args)
