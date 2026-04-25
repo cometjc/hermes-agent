@@ -7,6 +7,8 @@ can invoke skills via /skill-name commands.
 import json
 import logging
 import re
+import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -23,6 +25,7 @@ _skill_commands: Dict[str, Dict[str, Any]] = {}
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
+_PLAN_SLUG_RE = re.compile(r"[^a-z0-9]+")
 # Matches ${HERMES_SKILL_DIR} / ${HERMES_SESSION_ID} tokens in SKILL.md.
 # Tokens that don't resolve (e.g. ${HERMES_SESSION_ID} with no session) are
 # left as-is so the user can debug them.
